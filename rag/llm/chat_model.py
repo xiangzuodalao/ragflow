@@ -117,9 +117,32 @@ def _apply_model_family_policies(
     sanitized_gen_conf = deepcopy(gen_conf) if gen_conf else {}
     sanitized_kwargs = dict(request_kwargs) if request_kwargs else {}
 
-    # Qwen3 family disables thinking by extra_body on non-stream chat requests.
-    if "qwen3" in model_name_lower:
-        sanitized_kwargs["extra_body"] = {"enable_thinking": False}
+    # Determine if we should enable or disable thinking
+    is_stream = (
+        sanitized_gen_conf.get("stream", False)
+        or sanitized_kwargs.get("stream", False)
+        or (gen_conf is not None and "stream" in gen_conf)
+    )
+    # Check RAGFlow's prompt_config 'reasoning' key as well as standard 'with_reasoning'
+    with_reasoning = (
+        sanitized_kwargs.get("with_reasoning", True)
+        and sanitized_gen_conf.get("with_reasoning", True)
+        and sanitized_kwargs.get("reasoning", True)
+        and sanitized_gen_conf.get("reasoning", True)
+    )
+
+    # Qwen3 and DeepSeek-R1 families disable thinking by extra_body on non-stream chat requests,
+    # or when with_reasoning is explicitly False.
+    if "qwen3" in model_name_lower or "r1" in model_name_lower or "qwq" in model_name_lower:
+        if not is_stream or not with_reasoning:
+            if provider == SupportedLiteLLMProvider.Ollama or provider == "Ollama":
+                if backend == "litellm":
+                    # Ollama's OpenAI compatible /v1/chat/completions endpoint accepts "reasoning_effort": "none" to disable thinking
+                    sanitized_gen_conf["reasoning_effort"] = "none"
+                else:
+                    sanitized_kwargs["extra_body"] = {"think": False}
+            else:
+                sanitized_kwargs["extra_body"] = {"enable_thinking": False}
 
     if backend == "base":
         return sanitized_gen_conf, sanitized_kwargs
@@ -156,6 +179,7 @@ def _apply_model_family_policies(
         return sanitized_gen_conf, sanitized_kwargs
 
     return sanitized_gen_conf, sanitized_kwargs
+
 
 
 class Base(ABC):
@@ -1544,7 +1568,21 @@ class LiteLLMBase(ABC):
         reasoning_start = False
         total_tokens = 0
 
-        completion_args = self._construct_completion_args(history=history, stream=True, tools=False, **gen_conf)
+        # Apply model family policies for kwargs (with is_stream = True)
+        kwargs_copy = dict(kwargs)
+        kwargs_copy["stream"] = True
+        _, policy_kwargs = _apply_model_family_policies(
+            self.model_name,
+            backend="litellm",
+            provider=self.provider,
+            gen_conf=gen_conf,
+            request_kwargs=kwargs_copy,
+        )
+        policy_kwargs.pop("stream", None)
+        gen_conf_copy = dict(gen_conf)
+        gen_conf_copy.pop("stream", None)
+
+        completion_args = self._construct_completion_args(history=history, stream=True, tools=False, **{**gen_conf_copy, **policy_kwargs})
         stop = kwargs.get("stop")
         if stop:
             completion_args["stop"] = stop
