@@ -251,7 +251,7 @@ function ensure_db_init() {
 function wait_for_server() {
     local url="$1"
     local server_name="$2"
-    local timeout=90
+    local timeout="${RAGFLOW_STARTUP_TIMEOUT:-300}"
     local interval=2
     local start_time=$(date +%s)
 
@@ -284,9 +284,6 @@ if [[ "${INIT_MODEL_PROVIDER_TABLES}" -eq 1 ]]; then
 fi
 
 if [[ "${ENABLE_WEBSERVER}" -eq 1 ]]; then
-    echo "Starting nginx..."
-    /usr/sbin/nginx
-
     while true; do
         echo "Attempt to start RAGFlow server..."
         "$PY" api/ragflow_server.py ${INIT_SUPERUSER_ARGS}
@@ -305,7 +302,6 @@ if [[ "${ENABLE_WEBSERVER}" -eq 1 ]]; then
     fi
 fi
 
-
 if [[ "${ENABLE_ADMIN_SERVER}" -eq 1 ]]; then
     while true; do
         echo "Attempt to start Admin python server..."
@@ -323,6 +319,21 @@ if [[ "${ENABLE_ADMIN_SERVER}" -eq 1 ]]; then
             sleep 1;
         done &
     fi
+fi
+
+if [[ "${ENABLE_WEBSERVER}" -eq 1 ]]; then
+    if [[ "${API_PROXY_SCHEME}" == "go" ]]; then
+        wait_for_server "http://127.0.0.1:9384/api/v1/system/healthz" "ragflow_go_server"
+    else
+        wait_for_server "http://127.0.0.1:9380/api/v1/system/healthz" "ragflow_server"
+    fi
+
+    if [[ "${ENABLE_ADMIN_SERVER}" -eq 1 ]]; then
+        wait_for_server "http://127.0.0.1:9381/api/v1/admin/ping" "admin_server"
+    fi
+
+    echo "Starting nginx..."
+    /usr/sbin/nginx
 fi
 
 if [[ "${ENABLE_DATASYNC}" -eq 1 ]]; then

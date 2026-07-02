@@ -534,7 +534,11 @@
                     "tags": "LLM,CHAT,1M,IMAGE2TEXT",
                     "max_tokens": 1000000,
                     "model_type": "chat",
-                    "is_tools": true
+                    "is_tools": true,
+                    "thinking": {
+                        "default_value": true,
+                        "clear_thinking": true
+                    }
                 },
                 {
                     "llm_name": "qwen3.5-plus-2026-02-15",

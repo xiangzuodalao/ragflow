@@ -210,6 +210,19 @@ def get_model_config_from_provider_instance(tenant_id, model_type: str|enum.Enum
 
     api_key, is_tool, api_key_payload = _decode_api_key_config(instance_obj.api_key)
     extra_fields = json.loads(instance_obj.extra) if instance_obj.extra else {}
+    fac_list = []
+    if provider_name:
+        region = extra_fields.get("region", "default")
+        if region == "intl" and provider_name.lower() == "siliconflow":
+            target_factory_name = "siliconflow_intl"
+        else:
+            target_factory_name = provider_name
+        fac_list = [f for f in settings.FACTORY_LLM_INFOS if f["name"] == target_factory_name]
+    factory_llm_info = None
+    if fac_list:
+        factory_llms = fac_list[0].get("llm", [])
+        factory_matches = [llm for llm in factory_llms if llm["llm_name"] == pure_model_name]
+        factory_llm_info = factory_matches[0] if factory_matches else None
 
     if model_obj:
         if model_obj.status == ActiveStatusEnum.INACTIVE.value:
@@ -227,17 +240,16 @@ def get_model_config_from_provider_instance(tenant_id, model_type: str|enum.Enum
             "is_tools": model_extra.get("is_tools", is_tool),
             "max_tokens": model_extra.get("max_tokens", 8192),
         }
+        thinking = model_extra.get("thinking")
+        if thinking is None and factory_llm_info:
+            thinking = factory_llm_info.get("thinking")
+        if thinking is not None:
+            model_config["thinking"] = thinking
         if api_key_payload is not None:
             model_config["api_key_payload"] = api_key_payload
 
         return model_config
     else:
-        region = extra_fields.get("region", "default")
-        if region == "intl" and provider_name.lower() == "siliconflow":
-            target_factory_name = "siliconflow_intl"
-        else:
-            target_factory_name = provider_name
-        fac_list = [f for f in settings.FACTORY_LLM_INFOS if f["name"] == target_factory_name]
         if not fac_list:
             raise LookupError(f"Model provider config not found: {provider_name}")
         llm_list = [llm for llm in fac_list[0]["llm"] if llm["llm_name"] == pure_model_name]
@@ -255,6 +267,8 @@ def get_model_config_from_provider_instance(tenant_id, model_type: str|enum.Enum
             "is_tools": llm_info.get("is_tools", is_tool),
             "max_tokens": llm_info.get("max_tokens", 8192),
         }
+        if llm_info.get("thinking") is not None:
+            model_config["thinking"] = llm_info.get("thinking")
         if api_key_payload is not None:
             model_config["api_key_payload"] = api_key_payload
         return model_config

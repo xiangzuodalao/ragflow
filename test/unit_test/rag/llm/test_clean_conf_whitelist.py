@@ -38,6 +38,7 @@ from rag.llm.chat_model import (
     LITELLM_ALLOWED_GEN_CONF_KEYS,
     Base,
     LiteLLMBase,
+    _apply_model_family_policies,
 )
 
 
@@ -121,3 +122,49 @@ def test_litellm_whitelist_is_superset_of_base():
 def test_model_type_not_whitelisted_anywhere():
     assert "model_type" not in ALLOWED_GEN_CONF_KEYS
     assert "model_type" not in LITELLM_ALLOWED_GEN_CONF_KEYS
+
+
+def test_reasoning_control_kwargs_do_not_reach_provider():
+    _, kwargs = _apply_model_family_policies(
+        "qwen3-32b",
+        backend="base",
+        request_kwargs={"reasoning": False, "with_reasoning": False, "stream": True},
+    )
+
+    assert "reasoning" not in kwargs
+    assert "with_reasoning" not in kwargs
+    assert kwargs["extra_body"] == {"enable_thinking": False}
+
+
+def test_qwen35_plus_reasoning_can_be_disabled():
+    _, kwargs = _apply_model_family_policies(
+        "qwen3.5-plus",
+        backend="base",
+        request_kwargs={"reasoning": False, "stream": True},
+    )
+
+    assert kwargs["extra_body"] == {"enable_thinking": False}
+    assert "reasoning" not in kwargs
+
+
+def test_configured_thinking_model_uses_button_state():
+    _, kwargs = _apply_model_family_policies(
+        "provider/model-with-arbitrary-name",
+        backend="base",
+        request_kwargs={"reasoning": False},
+        thinking_config={"default_value": True, "clear_thinking": True},
+    )
+
+    assert kwargs["extra_body"] == {"enable_thinking": False}
+    assert "reasoning" not in kwargs
+
+
+def test_kimi_reasoning_uses_request_kwargs():
+    gen_conf, kwargs = _apply_model_family_policies(
+        "kimi-k2.5",
+        backend="litellm",
+        request_kwargs={"reasoning": False},
+    )
+
+    assert gen_conf["thinking"] == {"type": "disabled"}
+    assert "reasoning" not in kwargs
