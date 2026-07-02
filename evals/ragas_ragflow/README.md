@@ -15,6 +15,21 @@ Install the evaluation-only dependencies:
 uv pip install requests openai ragas datasets langchain-openai pandas
 ```
 
+On Windows, prefer running the Ragas scoring step in WSL/Python 3.12 if the
+local Python/NumPy stack is unstable. The combination below was used for the
+initial Bailian baseline:
+
+```bash
+python3 -m venv /tmp/ragas_eval_venv
+/tmp/ragas_eval_venv/bin/python -m pip install \
+  requests openai ragas datasets langchain-openai pandas
+/tmp/ragas_eval_venv/bin/python -m pip install \
+  "langchain-community==0.2.19" \
+  "langchain-core==0.2.43" \
+  "langchain-openai==0.1.25" \
+  "numpy<2"
+```
+
 Create a local env file from `config.example.env`:
 
 ```bash
@@ -104,7 +119,9 @@ Each question creates one independent session:
 3. `DELETE /api/v1/chats/{chat_id}/sessions` with the created session IDs
 
 Use `--keep-sessions` when debugging. By default, eval sessions are deleted at
-the end of the run.
+the end of the run. If a response has no contexts, the runner retries once with
+a new independent session by default. Use `--empty-context-retries 0` to disable
+that behavior.
 
 ## Outputs
 
@@ -116,8 +133,9 @@ evals/ragas_ragflow/outputs/{run_id}/scores.csv
 evals/ragas_ragflow/outputs/{run_id}/summary.json
 ```
 
-`raw_responses.jsonl` keeps the complete reference chunk payload. Ragas receives
-`contexts` as `list[str]`, extracted from `reference.chunks[*].content`.
+`raw_responses.jsonl` keeps the complete raw response and reference chunk
+payload. Ragas receives `contexts` as `list[str]`, extracted from
+`reference.chunks[*].content`.
 
 ## Default Evaluation Settings
 
@@ -132,6 +150,10 @@ When `run_eval.py` creates a chat, it uses:
 - no cross-language search
 
 The initial Ragas metrics are faithfulness, answer relevancy, and context
-precision where supported by the installed Ragas version. After adding manually
-reviewed `ground_truth` answers, extend the run with answer correctness and
-context recall.
+precision where supported by the installed Ragas version. The Bailian
+`deepseek-v4-flash` judge is called with `n=1` and `enable_thinking=false` for
+OpenAI-compatible API compatibility. Bailian `text-embedding-v4` is called
+through LangChain with local embedding context splitting disabled.
+
+After adding manually reviewed `ground_truth` answers, extend the run with
+answer correctness and context recall.

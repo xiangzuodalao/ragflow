@@ -31,7 +31,7 @@ def load_env_file(path: str | None) -> None:
     env_path = Path(path)
     if not env_path.exists():
         return
-    for line in env_path.read_text(encoding="utf-8").splitlines():
+    for line in env_path.read_text(encoding="utf-8-sig").splitlines():
         line = line.strip()
         if not line or line.startswith("#") or "=" not in line:
             continue
@@ -290,9 +290,12 @@ def generate_question(client: Any, model: str, chunk: CandidateChunk, category: 
     question = str(obj.get("question", "")).strip()
     if not question:
         raise ValueError("Question generator returned an empty question.")
+    generated_category = str(obj.get("category") or category).strip() or category
+    if generated_category not in DEFAULT_CATEGORIES:
+        generated_category = category
     return {
         "question": question,
-        "category": str(obj.get("category") or category).strip() or category,
+        "category": generated_category,
         "difficulty": str(obj.get("difficulty") or "medium").strip() or "medium",
     }
 

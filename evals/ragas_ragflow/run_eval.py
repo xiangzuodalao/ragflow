@@ -20,7 +20,7 @@ def load_env_file(path: str | None) -> None:
     env_path = Path(path)
     if not env_path.exists():
         return
-    for line in env_path.read_text(encoding="utf-8").splitlines():
+    for line in env_path.read_text(encoding="utf-8-sig").splitlines():
         line = line.strip()
         if not line or line.startswith("#") or "=" not in line:
             continue
@@ -160,33 +160,48 @@ def collect_responses(
     run_id: str,
     raw_path: Path,
     keep_sessions: bool,
+    empty_context_retries: int = 1,
 ) -> list[dict[str, Any]]:
     records: list[dict[str, Any]] = []
     created_sessions: list[str] = []
     try:
         for idx, sample in enumerate(samples, start=1):
             question = sample["question"]
-            session_id = client.create_session(chat_id, f"eval-{run_id}-{idx:04d}")
-            created_sessions.append(session_id)
-            started = time.time()
             raw_row: dict[str, Any] = {
                 "sample_id": sample.get("id", f"{run_id}-{idx:04d}"),
-                "session_id": session_id,
                 "question": question,
                 "source_chunk_id": sample.get("source_chunk_id"),
                 "document_name": sample.get("document_name"),
             }
             try:
-                data = client.ask(chat_id, session_id, question)
-                answer = data.get("answer") or ""
-                contexts, raw_chunks = contexts_from_reference(data.get("reference"))
-                elapsed = time.time() - started
+                answer = ""
+                contexts: list[str] = []
+                raw_chunks: list[dict[str, Any]] = []
+                data: dict[str, Any] = {}
+                elapsed = 0.0
+                session_id = ""
+                retry_count = 0
+                for attempt in range(empty_context_retries + 1):
+                    session_id = client.create_session(chat_id, f"eval-{run_id}-{idx:04d}-{attempt + 1}")
+                    created_sessions.append(session_id)
+                    started = time.time()
+                    data = client.ask(chat_id, session_id, question)
+                    answer = data.get("answer") or ""
+                    contexts, raw_chunks = contexts_from_reference(data.get("reference"))
+                    elapsed = time.time() - started
+                    retry_count = attempt
+                    if contexts or attempt >= empty_context_retries:
+                        break
+                    time.sleep(1.5)
                 raw_row.update(
                     {
+                        "session_id": session_id,
                         "answer": answer,
                         "contexts": contexts,
                         "reference_chunks": raw_chunks,
+                        "raw_response": data,
                         "elapsed_seconds": elapsed,
+                        "retry_count": retry_count,
                         "error": None,
                     }
                 )
@@ -201,11 +216,13 @@ def collect_responses(
                         "document_name": sample.get("document_name", ""),
                         "session_id": session_id,
                         "elapsed_seconds": elapsed,
+                        "retry_count": retry_count,
                     }
                 )
-                print(f"[{idx}/{len(samples)}] contexts={len(contexts)} seconds={elapsed:.2f}")
+                retry_note = f" retries={retry_count}" if retry_count else ""
+                print(f"[{idx}/{len(samples)}] contexts={len(contexts)} seconds={elapsed:.2f}{retry_note}")
             except Exception as exc:
-                raw_row.update({"answer": "", "contexts": [], "reference_chunks": [], "error": str(exc)})
+                raw_row.update({"answer": "", "contexts": [], "reference_chunks": [], "raw_response": {}, "error": str(exc)})
                 print(f"[{idx}/{len(samples)}] ERROR: {exc}", file=sys.stderr)
             append_jsonl(raw_path, raw_row)
     finally:
@@ -314,8 +331,20 @@ def build_ragas_models() -> tuple[Any, Any | None]:
     judge_model = env("RAGAS_JUDGE_MODEL", "deepseek-v4-flash")
     embedding_model = env("RAGAS_EMBEDDING_MODEL", "text-embedding-v4")
 
-    chat = ChatOpenAI(model=judge_model, api_key=api_key, base_url=base_url, temperature=0)
-    embeddings = OpenAIEmbeddings(model=embedding_model, api_key=api_key, base_url=base_url)
+    chat = ChatOpenAI(
+        model=judge_model,
+        api_key=api_key,
+        base_url=base_url,
+        temperature=0,
+        n=1,
+        extra_body={"enable_thinking": False},
+    )
+    embeddings = OpenAIEmbeddings(
+        model=embedding_model,
+        api_key=api_key,
+        base_url=base_url,
+        check_embedding_ctx_length=False,
+    )
     llm = LangchainLLMWrapper(chat) if LangchainLLMWrapper else chat
     wrapped_embeddings = LangchainEmbeddingsWrapper(embeddings) if LangchainEmbeddingsWrapper else embeddings
     return llm, wrapped_embeddings
@@ -407,6 +436,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--vector-similarity-weight", type=float, default=0.3)
     parser.add_argument("--top-k", type=int, default=1024)
     parser.add_argument("--top-n", type=int, default=6)
+    parser.add_argument("--empty-context-retries", type=int, default=1)
     return parser
 
 
@@ -447,6 +477,7 @@ def main() -> int:
         run_id=args.run_id,
         raw_path=raw_path,
         keep_sessions=args.keep_sessions,
+        empty_context_retries=max(args.empty_context_retries, 0),
     )
     if not records:
         raise SystemExit("No successful RAGFlow responses were collected.")
