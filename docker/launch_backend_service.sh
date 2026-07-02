@@ -268,12 +268,5 @@ if [[ "$START_DATA_SYNC" -eq 1 ]]; then
   PIDS+=($!)
 fi
 
-# Start the Python admin server (9381) when ENABLE_ADMIN_SERVER=1
-run_admin_server &
-PIDS+=($!)
-
-# Start the Go server(s) when running in hybrid or go mode
-run_go_servers
-
 # Wait for all background processes to finish
 wait
