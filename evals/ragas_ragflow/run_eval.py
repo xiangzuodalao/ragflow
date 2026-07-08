@@ -7,6 +7,7 @@ import argparse
 import csv
 import json
 import os
+import re
 import statistics
 import sys
 import time
@@ -77,7 +78,11 @@ class RAGFlowClient:
             "vector_similarity_weight": args.vector_similarity_weight,
             "top_k": args.top_k,
             "top_n": args.top_n,
-            "rerank_id": "",
+            "rerank_id": args.rerank_id,
+            "prompt_config": {
+                "enable_table_entity_filter": not args.disable_table_entity_filter,
+                "disable_sql_retrieval": args.disable_sql_retrieval,
+            },
         }
         return self.request("POST", "/chats", json=payload)
 
@@ -118,6 +123,34 @@ class RAGFlowClient:
             json={"chat_id": chat_id, "session_id": session_id, "question": question, "stream": False},
         )
 
+    def retrieve(
+        self,
+        question: str,
+        dataset_ids: list[str],
+        args: argparse.Namespace,
+        reference_chunk_count: int = 0,
+    ) -> dict[str, Any]:
+        page_size = args.fallback_retrieval_page_size
+        if page_size <= 0:
+            page_size = reference_chunk_count or args.top_n
+        if reference_chunk_count > 0:
+            page_size = min(page_size, reference_chunk_count)
+        payload = {
+            "question": question,
+            "dataset_ids": dataset_ids,
+            "page": 1,
+            "page_size": max(page_size, 1),
+            "similarity_threshold": args.similarity_threshold,
+            "vector_similarity_weight": args.vector_similarity_weight,
+            "top_k": args.top_k,
+            "rerank_id": args.rerank_id,
+            "highlight": False,
+            "use_kg": False,
+            "cross_languages": [],
+            "enable_table_entity_filter": not args.disable_table_entity_filter,
+        }
+        return self.request("POST", "/retrieval", json=payload)
+
 
 def read_jsonl(path: Path, limit: int | None = None) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
@@ -138,19 +171,120 @@ def append_jsonl(path: Path, row: dict[str, Any]) -> None:
         file.write(json.dumps(row, ensure_ascii=False) + "\n")
 
 
-def contexts_from_reference(reference: Any) -> tuple[list[str], list[dict[str, Any]]]:
+CHUNK_TEXT_FIELDS = (
+    "content",
+    "content_with_weight",
+    "content_with_weight_ltks",
+    "text",
+    "highlight",
+)
+
+
+def normalize_context_text(value: Any) -> str:
+    if isinstance(value, str):
+        text = value
+    elif isinstance(value, list):
+        text = "\n".join(str(item) for item in value if item is not None)
+    else:
+        return ""
+    text = re.sub(r"<[^>]+>", " ", text)
+    text = re.sub(r"[ \t]+\n", "\n", text)
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    return text.strip()
+
+
+def chunk_context_text(chunk: dict[str, Any]) -> tuple[str, str]:
+    for field in CHUNK_TEXT_FIELDS:
+        text = normalize_context_text(chunk.get(field))
+        if text:
+            return text, field
+    return "", ""
+
+
+def contexts_from_reference(reference: Any) -> tuple[list[str], list[dict[str, Any]], dict[str, Any]]:
+    stats: dict[str, Any] = {
+        "reference_chunk_count": 0,
+        "extracted_context_count": 0,
+        "null_content_chunk_count": 0,
+        "empty_text_chunk_count": 0,
+        "field_counts": {},
+        "extraction_source": "reference",
+    }
     if not isinstance(reference, dict):
-        return [], []
+        stats["extraction_source"] = "none"
+        return [], [], stats
     contexts: list[str] = []
     raw_chunks: list[dict[str, Any]] = []
     for chunk in reference.get("chunks") or []:
         if not isinstance(chunk, dict):
             continue
         raw_chunks.append(chunk)
-        content = chunk.get("content")
-        if isinstance(content, str) and content.strip():
-            contexts.append(content.strip())
-    return contexts, raw_chunks
+        if chunk.get("content") is None:
+            stats["null_content_chunk_count"] += 1
+        text, field = chunk_context_text(chunk)
+        if text:
+            contexts.append(text)
+            field_counts = stats["field_counts"]
+            field_counts[field] = field_counts.get(field, 0) + 1
+        else:
+            stats["empty_text_chunk_count"] += 1
+    stats["reference_chunk_count"] = len(raw_chunks)
+    stats["extracted_context_count"] = len(contexts)
+    if not contexts and raw_chunks:
+        stats["extraction_source"] = "empty_reference_chunks"
+    return contexts, raw_chunks, stats
+
+
+def contexts_from_prompt(prompt: Any) -> list[str]:
+    if not isinstance(prompt, str) or "Content:" not in prompt:
+        return []
+    contexts: list[str] = []
+    seen: set[str] = set()
+    blocks = re.split(r"\n\s*------\s*\n", prompt)
+    for block in blocks:
+        if "Content:" not in block:
+            continue
+        _, content = block.split("Content:", 1)
+        content = re.split(
+            r"\n\s*(?:------|The above is the knowledge base\.|### Query:|## Time elapsed:)",
+            content,
+            maxsplit=1,
+        )[0]
+        text = normalize_context_text(content)
+        if not text or text in seen:
+            continue
+        seen.add(text)
+        contexts.append(text)
+    return contexts
+
+
+def contexts_from_response(data: dict[str, Any]) -> tuple[list[str], list[dict[str, Any]], dict[str, Any]]:
+    contexts, raw_chunks, stats = contexts_from_reference(data.get("reference"))
+    if contexts:
+        return contexts, raw_chunks, stats
+
+    prompt_contexts = contexts_from_prompt(data.get("prompt"))
+    if prompt_contexts:
+        stats = dict(stats)
+        stats["extraction_source"] = "prompt_fallback"
+        stats["prompt_context_count"] = len(prompt_contexts)
+        stats["extracted_context_count"] = len(prompt_contexts)
+        return prompt_contexts, raw_chunks, stats
+
+    stats["prompt_context_count"] = 0
+    return contexts, raw_chunks, stats
+
+
+def fallback_dataset_ids(sample: dict[str, Any], raw_chunks: list[dict[str, Any]]) -> list[str]:
+    ids: list[str] = []
+    sample_dataset_id = sample.get("dataset_id")
+    if isinstance(sample_dataset_id, str) and sample_dataset_id.strip():
+        ids.append(sample_dataset_id.strip())
+    for chunk in raw_chunks:
+        dataset_id = chunk.get("dataset_id")
+        if isinstance(dataset_id, str) and dataset_id.strip():
+            ids.append(dataset_id.strip())
+    return list(dict.fromkeys(ids))
 
 
 def collect_responses(
@@ -160,6 +294,7 @@ def collect_responses(
     run_id: str,
     raw_path: Path,
     keep_sessions: bool,
+    args: argparse.Namespace,
     empty_context_retries: int = 1,
 ) -> list[dict[str, Any]]:
     records: list[dict[str, Any]] = []
@@ -177,6 +312,8 @@ def collect_responses(
                 answer = ""
                 contexts: list[str] = []
                 raw_chunks: list[dict[str, Any]] = []
+                context_extraction: dict[str, Any] = {}
+                retrieval_fallback: dict[str, Any] | None = None
                 data: dict[str, Any] = {}
                 elapsed = 0.0
                 session_id = ""
@@ -187,7 +324,27 @@ def collect_responses(
                     started = time.time()
                     data = client.ask(chat_id, session_id, question)
                     answer = data.get("answer") or ""
-                    contexts, raw_chunks = contexts_from_reference(data.get("reference"))
+                    contexts, raw_chunks, context_extraction = contexts_from_response(data)
+                    if not contexts and not args.disable_retrieval_fallback:
+                        dataset_ids = fallback_dataset_ids(sample, raw_chunks)
+                        if dataset_ids:
+                            retrieval_fallback = client.retrieve(
+                                question,
+                                dataset_ids,
+                                args,
+                                reference_chunk_count=context_extraction.get("reference_chunk_count", 0),
+                            )
+                            contexts, fallback_chunks, fallback_stats = contexts_from_reference(retrieval_fallback)
+                            if contexts:
+                                raw_chunks = fallback_chunks
+                                context_extraction = {
+                                    **context_extraction,
+                                    "extraction_source": "retrieval_fallback",
+                                    "fallback_dataset_ids": dataset_ids,
+                                    "fallback_reference_chunk_count": fallback_stats.get("reference_chunk_count", 0),
+                                    "fallback_extracted_context_count": fallback_stats.get("extracted_context_count", 0),
+                                    "fallback_field_counts": fallback_stats.get("field_counts", {}),
+                                }
                     elapsed = time.time() - started
                     retry_count = attempt
                     if contexts or attempt >= empty_context_retries:
@@ -199,6 +356,8 @@ def collect_responses(
                         "answer": answer,
                         "contexts": contexts,
                         "reference_chunks": raw_chunks,
+                        "context_extraction": context_extraction,
+                        "retrieval_fallback": retrieval_fallback,
                         "raw_response": data,
                         "elapsed_seconds": elapsed,
                         "retry_count": retry_count,
@@ -211,18 +370,30 @@ def collect_responses(
                         "question": question,
                         "answer": answer,
                         "contexts": contexts,
+                        "ground_truth": sample.get("ground_truth", ""),
                         "expected_evidence": sample.get("expected_evidence", ""),
+                        "category": sample.get("category", ""),
                         "source_chunk_id": sample.get("source_chunk_id", ""),
                         "document_name": sample.get("document_name", ""),
                         "session_id": session_id,
                         "elapsed_seconds": elapsed,
                         "retry_count": retry_count,
+                        "context_extraction": context_extraction,
                     }
                 )
                 retry_note = f" retries={retry_count}" if retry_count else ""
                 print(f"[{idx}/{len(samples)}] contexts={len(contexts)} seconds={elapsed:.2f}{retry_note}")
             except Exception as exc:
-                raw_row.update({"answer": "", "contexts": [], "reference_chunks": [], "raw_response": {}, "error": str(exc)})
+                raw_row.update(
+                    {
+                        "answer": "",
+                        "contexts": [],
+                        "reference_chunks": [],
+                        "context_extraction": {},
+                        "raw_response": {},
+                        "error": str(exc),
+                    }
+                )
                 print(f"[{idx}/{len(samples)}] ERROR: {exc}", file=sys.stderr)
             append_jsonl(raw_path, raw_row)
     finally:
@@ -243,6 +414,43 @@ def collect_responses(
     return records
 
 
+def records_from_raw_responses(raw_rows: list[dict[str, Any]], samples: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    samples_by_id = {str(sample.get("id", "")): sample for sample in samples if sample.get("id")}
+    samples_by_question = {str(sample.get("question", "")): sample for sample in samples if sample.get("question")}
+    records: list[dict[str, Any]] = []
+    for idx, row in enumerate(raw_rows, start=1):
+        if row.get("error"):
+            continue
+        sample_id = str(row.get("sample_id") or f"raw-{idx:04d}")
+        sample = samples_by_id.get(sample_id) or samples_by_question.get(str(row.get("question", ""))) or {}
+        contexts = row.get("contexts")
+        if not isinstance(contexts, list):
+            contexts = []
+        elapsed = row.get("elapsed_seconds", 0.0)
+        try:
+            elapsed = float(elapsed)
+        except (TypeError, ValueError):
+            elapsed = 0.0
+        records.append(
+            {
+                "sample_id": sample_id,
+                "question": row.get("question") or sample.get("question", ""),
+                "answer": row.get("answer") or "",
+                "contexts": contexts,
+                "ground_truth": sample.get("ground_truth") or row.get("ground_truth", ""),
+                "expected_evidence": sample.get("expected_evidence") or row.get("expected_evidence", ""),
+                "category": sample.get("category") or row.get("category", ""),
+                "source_chunk_id": sample.get("source_chunk_id") or row.get("source_chunk_id", ""),
+                "document_name": sample.get("document_name") or row.get("document_name", ""),
+                "session_id": row.get("session_id", ""),
+                "elapsed_seconds": elapsed,
+                "retry_count": row.get("retry_count", 0),
+                "context_extraction": row.get("context_extraction") or {},
+            }
+        )
+    return records
+
+
 def make_ragas_dataset(records: list[dict[str, Any]]) -> Any:
     try:
         from datasets import Dataset
@@ -253,16 +461,17 @@ def make_ragas_dataset(records: list[dict[str, Any]]) -> Any:
         ) from exc
     rows = []
     for record in records:
+        reference = record.get("ground_truth") or record["expected_evidence"]
         rows.append(
             {
                 "user_input": record["question"],
                 "response": record["answer"],
                 "retrieved_contexts": record["contexts"],
-                "reference": record["expected_evidence"],
+                "reference": reference,
                 "question": record["question"],
                 "answer": record["answer"],
                 "contexts": record["contexts"],
-                "ground_truth": record["expected_evidence"],
+                "ground_truth": reference,
                 "sample_id": record["sample_id"],
             }
         )
@@ -302,9 +511,39 @@ def build_ragas_metrics() -> list[Any]:
             selected.append(metric() if isinstance(metric, type) else metric)
             break
 
+    for class_name, variable_name in [
+        ("AnswerCorrectness", "answer_correctness"),
+        ("ContextRecall", "context_recall"),
+    ]:
+        metric = getattr(metrics_mod, class_name, None)
+        if metric is not None:
+            selected.append(metric())
+            continue
+        metric = getattr(metrics_mod, variable_name, None)
+        if metric is not None:
+            selected.append(metric() if isinstance(metric, type) else metric)
+
     if not selected:
         raise SystemExit("Could not find compatible Ragas metrics in the installed ragas package.")
     return selected
+
+
+def is_metric_column(column: str) -> bool:
+    return column not in {
+        "user_input",
+        "response",
+        "retrieved_contexts",
+        "reference",
+        "question",
+        "answer",
+        "contexts",
+        "ground_truth",
+        "sample_id",
+        "category",
+        "context_count",
+        "retry_count",
+        "context_extraction_source",
+    }
 
 
 def build_ragas_models() -> tuple[Any, Any | None]:
@@ -364,9 +603,19 @@ def run_ragas(records: list[dict[str, Any]], scores_path: Path) -> dict[str, Any
     )
     try:
         df = result.to_pandas()
+        for idx, record in enumerate(records):
+            if idx >= len(df):
+                break
+            df.loc[idx, "sample_id"] = record["sample_id"]
+            df.loc[idx, "category"] = record.get("category", "")
+            df.loc[idx, "context_count"] = len(record["contexts"])
+            df.loc[idx, "retry_count"] = record.get("retry_count", 0)
+            df.loc[idx, "context_extraction_source"] = record.get("context_extraction", {}).get("extraction_source", "")
         df.to_csv(scores_path, index=False)
         metric_means = {}
         for column in df.columns:
+            if not is_metric_column(column):
+                continue
             try:
                 values = [float(v) for v in df[column].dropna().tolist()]
             except (TypeError, ValueError):
@@ -389,6 +638,7 @@ def write_fallback_scores(records: list[dict[str, Any]], scores_path: Path) -> N
         "document_name",
         "session_id",
         "elapsed_seconds",
+        "context_extraction_source",
     ]
     with scores_path.open("w", encoding="utf-8", newline="") as file:
         writer = csv.DictWriter(file, fieldnames=fieldnames)
@@ -404,6 +654,7 @@ def write_fallback_scores(records: list[dict[str, Any]], scores_path: Path) -> N
                     "document_name": record["document_name"],
                     "session_id": record["session_id"],
                     "elapsed_seconds": f"{record['elapsed_seconds']:.3f}",
+                    "context_extraction_source": record.get("context_extraction", {}).get("extraction_source", ""),
                 }
             )
 
@@ -411,10 +662,39 @@ def write_fallback_scores(records: list[dict[str, Any]], scores_path: Path) -> N
 def build_summary(records: list[dict[str, Any]], ragas_summary: dict[str, Any] | None) -> dict[str, Any]:
     elapsed = [record["elapsed_seconds"] for record in records]
     no_context = [record["sample_id"] for record in records if not record["contexts"]]
+    null_content_reference = [
+        record["sample_id"]
+        for record in records
+        if record.get("context_extraction", {}).get("reference_chunk_count", 0) > 0
+        and record.get("context_extraction", {}).get("null_content_chunk_count", 0) > 0
+    ]
+    prompt_fallback = [
+        record["sample_id"]
+        for record in records
+        if record.get("context_extraction", {}).get("extraction_source") == "prompt_fallback"
+    ]
+    retrieval_fallback = [
+        record["sample_id"]
+        for record in records
+        if record.get("context_extraction", {}).get("extraction_source") == "retrieval_fallback"
+    ]
+    empty_reference_chunks = [
+        record["sample_id"]
+        for record in records
+        if record.get("context_extraction", {}).get("extraction_source") == "empty_reference_chunks"
+    ]
     return {
         "sample_count": len(records),
         "no_context_count": len(no_context),
         "no_context_sample_ids": no_context[:20],
+        "null_content_reference_count": len(null_content_reference),
+        "null_content_reference_sample_ids": null_content_reference[:20],
+        "prompt_context_fallback_count": len(prompt_fallback),
+        "prompt_context_fallback_sample_ids": prompt_fallback[:20],
+        "retrieval_fallback_count": len(retrieval_fallback),
+        "retrieval_fallback_sample_ids": retrieval_fallback[:20],
+        "empty_reference_chunks_count": len(empty_reference_chunks),
+        "empty_reference_chunks_sample_ids": empty_reference_chunks[:20],
         "latency_seconds_avg": statistics.fmean(elapsed) if elapsed else None,
         "latency_seconds_p50": statistics.median(elapsed) if elapsed else None,
         "ragas": ragas_summary or {},
@@ -431,12 +711,19 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--chat-id")
     parser.add_argument("--dataset-id")
     parser.add_argument("--keep-sessions", action="store_true")
+    parser.add_argument("--skip-retrieval", action="store_true")
+    parser.add_argument("--raw-responses")
     parser.add_argument("--skip-ragas", action="store_true")
     parser.add_argument("--similarity-threshold", type=float, default=0.2)
-    parser.add_argument("--vector-similarity-weight", type=float, default=0.3)
-    parser.add_argument("--top-k", type=int, default=1024)
+    parser.add_argument("--vector-similarity-weight", type=float, default=0.7)
+    parser.add_argument("--top-k", type=int, default=50)
     parser.add_argument("--top-n", type=int, default=6)
+    parser.add_argument("--rerank-id", default=env("RAGFLOW_RERANK_ID", "qwen3-rerank@agent调用@Tongyi-Qianwen"))
     parser.add_argument("--empty-context-retries", type=int, default=1)
+    parser.add_argument("--fallback-retrieval-page-size", type=int, default=30)
+    parser.add_argument("--disable-retrieval-fallback", action="store_true")
+    parser.add_argument("--disable-table-entity-filter", action="store_true")
+    parser.add_argument("--disable-sql-retrieval", action="store_true")
     return parser
 
 
@@ -460,25 +747,34 @@ def main() -> int:
     scores_path = output_dir / "scores.csv"
     summary_path = output_dir / "summary.json"
 
-    client = RAGFlowClient(require_env("RAGFLOW_BASE_URL"), require_env("RAGFLOW_API_KEY"))
-    chat_id = args.chat_id
-    if not chat_id:
-        dataset_id = args.dataset_id or samples[0].get("dataset_id")
-        if not dataset_id:
-            raise SystemExit("Provide --chat-id or --dataset-id, or include dataset_id in evalset rows.")
-        chat = client.create_chat(f"ragas-eval-{args.run_id}", [dataset_id], args)
-        chat_id = chat["id"]
-        print(f"Created eval chat {chat_id} for dataset {dataset_id}")
+    if args.skip_retrieval:
+        source_raw_path = Path(args.raw_responses) if args.raw_responses else raw_path
+        if not source_raw_path.exists():
+            raise SystemExit(f"Missing raw responses file for --skip-retrieval: {source_raw_path}")
+        raw_rows = read_jsonl(source_raw_path)
+        records = records_from_raw_responses(raw_rows, samples)
+        print(f"Loaded {len(records)} records from {source_raw_path}")
+    else:
+        client = RAGFlowClient(require_env("RAGFLOW_BASE_URL"), require_env("RAGFLOW_API_KEY"))
+        chat_id = args.chat_id
+        if not chat_id:
+            dataset_id = args.dataset_id or samples[0].get("dataset_id")
+            if not dataset_id:
+                raise SystemExit("Provide --chat-id or --dataset-id, or include dataset_id in evalset rows.")
+            chat = client.create_chat(f"ragas-eval-{args.run_id}", [dataset_id], args)
+            chat_id = chat["id"]
+            print(f"Created eval chat {chat_id} for dataset {dataset_id}")
 
-    records = collect_responses(
-        client,
-        chat_id=chat_id,
-        samples=samples,
-        run_id=args.run_id,
-        raw_path=raw_path,
-        keep_sessions=args.keep_sessions,
-        empty_context_retries=max(args.empty_context_retries, 0),
-    )
+        records = collect_responses(
+            client,
+            chat_id=chat_id,
+            samples=samples,
+            run_id=args.run_id,
+            raw_path=raw_path,
+            keep_sessions=args.keep_sessions,
+            args=args,
+            empty_context_retries=max(args.empty_context_retries, 0),
+        )
     if not records:
         raise SystemExit("No successful RAGFlow responses were collected.")
 

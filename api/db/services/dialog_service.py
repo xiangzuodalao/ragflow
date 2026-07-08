@@ -45,6 +45,7 @@ from common.text_utils import normalize_arabic_digits
 from rag.graphrag.general.mind_map_extractor import MindMapExtractor
 from rag.advanced_rag import DeepResearcher
 from rag.app.tag import label_question
+from rag.nlp.table_entity_filter import build_table_entity_filter
 from rag.nlp.search import index_name
 from rag.prompts.generator import chunks_format, citation_prompt, cross_languages, full_question, kb_prompt, keyword_extraction, message_fit_in, PROMPT_JINJA_ENV, ASK_SUMMARY
 from common.token_utils import num_tokens_from_string
@@ -72,6 +73,23 @@ def _reasoning_model_kwargs(reasoning_enabled):
         "reasoning": reasoning_enabled,
         "with_reasoning": reasoning_enabled,
     }
+
+
+def _sql_retrieval_enabled(prompt_config, request_payload=None, kbs=None):
+    request_payload = request_payload or {}
+    for source in (request_payload, prompt_config or {}):
+        if "enable_sql_retrieval" in source:
+            return _coerce_bool(source.get("enable_sql_retrieval"))
+        if "disable_sql_retrieval" in source:
+            return not _coerce_bool(source.get("disable_sql_retrieval"))
+    # When entity filter is active for table KBs, use RAG+filter instead of SQL retrieval
+    try:
+        from rag.nlp.table_entity_filter import table_entity_filter_enabled
+        if table_entity_filter_enabled(prompt_config, request_payload, kbs=kbs):
+            return False
+    except ImportError:
+        pass
+    return True
 
 
 def _chunk_kb_id_for_doc(row_dict, kb_ids, doc_id):
@@ -633,7 +651,7 @@ async def async_chat(dialog, messages, stream=True, **kwargs):
     field_map = KnowledgebaseService.get_field_map(dialog.kb_ids)
     logging.debug(f"field_map retrieved: {field_map}")
     # try to use sql if field mapping is good to go
-    if field_map:
+    if field_map and _sql_retrieval_enabled(prompt_config, kwargs, kbs=kbs):
         logging.debug("Use SQL to retrieval:{}".format(questions[-1]))
         ans = await use_sql(questions[-1], field_map, dialog.tenant_id, chat_mdl, prompt_config.get("quote", True), dialog.kb_ids)
         # For aggregate queries (COUNT, SUM, etc.), chunks may be empty but answer is still valid
@@ -674,6 +692,14 @@ async def async_chat(dialog, messages, stream=True, **kwargs):
     if prompt_config.get("cross_languages"):
         questions = [await cross_languages(dialog.tenant_id, dialog.llm_id, questions[0], prompt_config["cross_languages"])]
 
+    table_entity_plan = build_table_entity_filter(
+        " ".join(questions),
+        kbs,
+        field_map,
+        prompt_config,
+        kwargs,
+    )
+
     if dialog.meta_data_filter:
         attachments = await apply_meta_data_filter(
             dialog.meta_data_filter,
@@ -711,6 +737,8 @@ async def async_chat(dialog, messages, stream=True, **kwargs):
                     similarity_threshold=0.2,
                     vector_similarity_weight=0.3,
                     doc_ids=attachments,
+                    chunk_filters=table_entity_plan.filters if table_entity_plan else None,
+                    chunk_filter_debug=table_entity_plan.debug if table_entity_plan else None,
                 ),
                 internet_enabled=use_web_search,
             )
@@ -750,6 +778,8 @@ async def async_chat(dialog, messages, stream=True, **kwargs):
                     aggs=True,
                     rerank_mdl=rerank_mdl,
                     rank_feature=label_question(" ".join(questions), kbs),
+                    chunk_filters=table_entity_plan.filters if table_entity_plan else None,
+                    chunk_filter_debug=table_entity_plan.debug if table_entity_plan else None,
                 )
                 if prompt_config.get("toc_enhance"):
                     cks = await retriever.retrieval_by_toc(" ".join(questions), kbinfos["chunks"], tenant_ids, chat_mdl, dialog.top_n)
@@ -1654,6 +1684,14 @@ async def async_ask(question, kb_ids, tenant_id, chat_llm_name=None, search_conf
         rerank_mdl = LLMBundle(tenant_id, rerank_model_config)
     max_tokens = chat_mdl.max_length
     tenant_ids = list(set([kb.tenant_id for kb in kbs]))
+    field_map = KnowledgebaseService.get_field_map(kb_ids)
+    table_entity_plan = build_table_entity_filter(
+        question,
+        kbs,
+        field_map,
+        search_config,
+        search_config,
+    )
 
     if meta_data_filter:
         doc_ids = await apply_meta_data_filter(
@@ -1696,6 +1734,8 @@ async def async_ask(question, kb_ids, tenant_id, chat_llm_name=None, search_conf
         rerank_mdl=rerank_mdl,
         rank_feature=label_question(question, kbs),
         trace_id=search_id,
+        chunk_filters=table_entity_plan.filters if table_entity_plan else None,
+        chunk_filter_debug=table_entity_plan.debug if table_entity_plan else None,
     )
     if include_reference_metadata:
         logging.debug(
@@ -1780,6 +1820,15 @@ async def gen_mindmap(question, kb_ids, tenant_id, search_config={}):
             metas_loader=lambda: DocMetadataService.get_flatted_meta_by_kbs(kb_ids),
         )
 
+    field_map = KnowledgebaseService.get_field_map(kb_ids)
+    table_entity_plan = build_table_entity_filter(
+        question,
+        kbs,
+        field_map,
+        search_config,
+        search_config,
+    )
+
     ranks = await settings.retriever.retrieval(
         question=question,
         embd_mdl=embd_mdl,
@@ -1794,6 +1843,8 @@ async def gen_mindmap(question, kb_ids, tenant_id, search_config={}):
         aggs=False,
         rerank_mdl=rerank_mdl,
         rank_feature=label_question(question, kbs),
+        chunk_filters=table_entity_plan.filters if table_entity_plan else None,
+        chunk_filter_debug=table_entity_plan.debug if table_entity_plan else None,
     )
     mindmap = MindMapExtractor(chat_mdl)
     mind_map = await mindmap([c["content_with_weight"] for c in ranks["chunks"]])
