@@ -71,6 +71,9 @@ class RAGFlowClient:
         return payload.get("data")
 
     def create_chat(self, name: str, dataset_ids: list[str], args: argparse.Namespace) -> dict[str, Any]:
+        prompt_config: dict[str, Any] = {"enable_table_entity_filter": not args.disable_table_entity_filter}
+        if args.disable_sql_retrieval:
+            prompt_config["disable_sql_retrieval"] = True
         payload = {
             "name": name,
             "dataset_ids": dataset_ids,
@@ -79,10 +82,7 @@ class RAGFlowClient:
             "top_k": args.top_k,
             "top_n": args.top_n,
             "rerank_id": args.rerank_id,
-            "prompt_config": {
-                "enable_table_entity_filter": not args.disable_table_entity_filter,
-                "disable_sql_retrieval": args.disable_sql_retrieval,
-            },
+            "prompt_config": prompt_config,
         }
         return self.request("POST", "/chats", json=payload)
 
@@ -116,12 +116,19 @@ class RAGFlowClient:
             page += 1
         return matches
 
-    def ask(self, chat_id: str, session_id: str, question: str) -> dict[str, Any]:
-        return self.request(
-            "POST",
-            "/chat/completions",
-            json={"chat_id": chat_id, "session_id": session_id, "question": question, "stream": False},
-        )
+    def ask(self, chat_id: str, session_id: str, question: str, args: argparse.Namespace) -> dict[str, Any]:
+        # Pass switches per-request too, so retrieval routing is correct even if the
+        # chat-stored prompt_config was stripped of non-standard keys.
+        payload: dict[str, Any] = {
+            "chat_id": chat_id,
+            "session_id": session_id,
+            "question": question,
+            "stream": False,
+            "enable_table_entity_filter": not args.disable_table_entity_filter,
+        }
+        if args.disable_sql_retrieval:
+            payload["disable_sql_retrieval"] = True
+        return self.request("POST", "/chat/completions", json=payload)
 
     def retrieve(
         self,
@@ -322,7 +329,7 @@ def collect_responses(
                     session_id = client.create_session(chat_id, f"eval-{run_id}-{idx:04d}-{attempt + 1}")
                     created_sessions.append(session_id)
                     started = time.time()
-                    data = client.ask(chat_id, session_id, question)
+                    data = client.ask(chat_id, session_id, question, args)
                     answer = data.get("answer") or ""
                     contexts, raw_chunks, context_extraction = contexts_from_response(data)
                     if not contexts and not args.disable_retrieval_fallback:

@@ -45,7 +45,7 @@ from common.text_utils import normalize_arabic_digits
 from rag.graphrag.general.mind_map_extractor import MindMapExtractor
 from rag.advanced_rag import DeepResearcher
 from rag.app.tag import label_question
-from rag.nlp.table_entity_filter import build_table_entity_filter
+from rag.nlp.table_entity_filter import build_table_entity_filter, table_entity_filter_enabled
 from rag.nlp.search import index_name
 from rag.prompts.generator import chunks_format, citation_prompt, cross_languages, full_question, kb_prompt, keyword_extraction, message_fit_in, PROMPT_JINJA_ENV, ASK_SUMMARY
 from common.token_utils import num_tokens_from_string
@@ -77,18 +77,17 @@ def _reasoning_model_kwargs(reasoning_enabled):
 
 def _sql_retrieval_enabled(prompt_config, request_payload=None, kbs=None):
     request_payload = request_payload or {}
+    # Explicit enable takes priority. Note: disable_sql_retrieval=False is NOT an explicit
+    # enable (only True disables), so it falls through to the entity-filter check below.
     for source in (request_payload, prompt_config or {}):
         if "enable_sql_retrieval" in source:
             return _coerce_bool(source.get("enable_sql_retrieval"))
-        if "disable_sql_retrieval" in source:
-            return not _coerce_bool(source.get("disable_sql_retrieval"))
-    # When entity filter is active for table KBs, use RAG+filter instead of SQL retrieval
-    try:
-        from rag.nlp.table_entity_filter import table_entity_filter_enabled
-        if table_entity_filter_enabled(prompt_config, request_payload, kbs=kbs):
+    for source in (request_payload, prompt_config or {}):
+        if _coerce_bool(source.get("disable_sql_retrieval", False)):
             return False
-    except ImportError:
-        pass
+    # When entity filter is active for table KBs, use RAG+filter instead of SQL retrieval
+    if table_entity_filter_enabled(prompt_config, request_payload, kbs=kbs):
+        return False
     return True
 
 
@@ -651,7 +650,15 @@ async def async_chat(dialog, messages, stream=True, **kwargs):
     field_map = KnowledgebaseService.get_field_map(dialog.kb_ids)
     logging.debug(f"field_map retrieved: {field_map}")
     # try to use sql if field mapping is good to go
-    if field_map and _sql_retrieval_enabled(prompt_config, kwargs, kbs=kbs):
+    _sql_enabled = _sql_retrieval_enabled(prompt_config, kwargs, kbs=kbs)
+    logging.info(
+        "retrieval routing: sql_enabled=%s table_entity_filter_enabled=%s prompt_keys=%s request_keys=%s",
+        _sql_enabled,
+        table_entity_filter_enabled(prompt_config, kwargs, kbs=kbs),
+        sorted((prompt_config or {}).keys()),
+        sorted((kwargs or {}).keys()),
+    )
+    if field_map and _sql_enabled:
         logging.debug("Use SQL to retrieval:{}".format(questions[-1]))
         ans = await use_sql(questions[-1], field_map, dialog.tenant_id, chat_mdl, prompt_config.get("quote", True), dialog.kb_ids)
         # For aggregate queries (COUNT, SUM, etc.), chunks may be empty but answer is still valid

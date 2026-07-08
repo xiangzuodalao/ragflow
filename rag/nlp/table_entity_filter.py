@@ -118,6 +118,20 @@ def _strip_value(value: str) -> str:
     return value
 
 
+# Leading fault-code prefix that the 出现“...”时 故障描述 pattern swallows whole,
+# e.g. “NQ_WC120_036，12213 NG” -> 12213 NG. The pattern matches ASCII ["'] only,
+# so smart quotes wrapping the value are also trimmed here.
+_FAULT_CODE_PREFIX = re.compile(
+    '^[“”‘’"\']*\\s*[A-Z]{2,3}_WC\\d+_\\d+\\s*[，,；;:：]\\s*'
+)
+_VALUE_QUOTES = "“”‘’\"' "
+
+
+def _clean_fault_desc(value: str) -> str:
+    value = _FAULT_CODE_PREFIX.sub("", value)
+    return value.strip(_VALUE_QUOTES)
+
+
 def _first_match(patterns: list[str], text: str) -> str:
     for pattern in patterns:
         match = re.search(pattern, text, flags=re.IGNORECASE)
@@ -193,10 +207,23 @@ def _extract_entities(question: str) -> dict[str, Any]:
     )
     if fault_desc:
         cleaned = _strip_value(fault_desc.rstrip("？?？"))
+        cleaned = _clean_fault_desc(cleaned)
         if len(cleaned) < 2 or cleaned in {"什么", "哪些", "多少", "谁", "哪里", "哪个", "什么？", "什么原因"}:
-            fault_desc = ""
-    if fault_desc:
-        entities["故障描述"] = fault_desc
+            cleaned = ""
+        if cleaned:
+            entities["故障描述"] = cleaned
+
+    # Recover a standalone fault code from the question body and merge it as
+    # 故障代码 (without overriding an explicitly extracted one). The 故障描述 patterns
+    # above can swallow a fault code quoted alongside the description
+    # (e.g. 出现“NQ_WC120_036，12213 NG”时 captures the whole quoted string), so this
+    # recovers the code so it can filter on the 故障代码 field. Only the unambiguous
+    # `<PREFIX>_WC<digits>_<digits>` form is used — bare N/P codes are part of fault
+    # descriptions for some datasets and would mis-filter.
+    if "故障代码" not in entities:
+        fault_code = _first_match([r"([A-Z]{2,3}_WC\d+_\d+)"], q)
+        if fault_code:
+            entities["故障代码"] = fault_code
 
     # Weak extraction: when no explicit entity prefix found, try pattern-based extraction
     # from the question body (fault codes, device codes, line numbers)
