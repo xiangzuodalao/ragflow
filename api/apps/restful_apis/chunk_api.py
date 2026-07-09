@@ -60,6 +60,7 @@ from common.string_utils import is_content_empty, remove_redundant_spaces
 from common.tag_feature_utils import validate_tag_features
 from rag.app.tag import label_question
 from rag.nlp import search
+from rag.nlp.table_entity_filter import build_table_entity_filter
 from rag.prompts.generator import cross_languages, keyword_extraction
 
 
@@ -351,10 +352,15 @@ async def retrieval_test(tenant_id):
             chat_model_config = get_tenant_default_model_by_type(kb.tenant_id, LLMType.CHAT)
             question += await keyword_extraction(LLMBundle(kb.tenant_id, chat_model_config), question)
 
+        field_map = KnowledgebaseService.get_field_map(kb_ids)
+        table_entity_plan = build_table_entity_filter(question, kbs, field_map, req, req)
+
         ranks = await settings.retriever.retrieval(
             question, embd_mdl, tenant_ids, kb_ids, page, size, similarity_threshold,
             vector_similarity_weight, top, doc_ids, rerank_mdl=rerank_mdl,
             highlight=highlight, rank_feature=label_question(question, kbs),
+            chunk_filters=table_entity_plan.filters if table_entity_plan else None,
+            chunk_filter_debug=table_entity_plan.debug if table_entity_plan else None,
         )
         if toc_enhance:
             chat_model_config = get_tenant_default_model_by_type(kb.tenant_id, LLMType.CHAT)

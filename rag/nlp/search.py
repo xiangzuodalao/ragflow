@@ -127,6 +127,13 @@ class Dealer:
                     "removed_kwd"]:
             if key in req and req[key] is not None:
                 condition[key] = req[key]
+        chunk_filters = req.get("chunk_filters")
+        if isinstance(chunk_filters, dict):
+            for key, value in chunk_filters.items():
+                if key in condition:
+                    logging.warning("Skipping chunk filter for reserved condition key: %s", key)
+                    continue
+                condition[key] = value
         return condition
 
     async def search(self, req, idx_names: str | list[str],
@@ -587,6 +594,9 @@ class Dealer:
             highlight=False,
             rank_feature: dict | None = {PAGERANK_FLD: 10},
             trace_id=None,
+            chunk_filters: dict | list[dict] | None = None,
+            chunk_filter_debug: dict | None = None,
+            chunk_filter_fallback_to_plain: bool = True,
     ):
         ranks = {"total": 0, "chunks": [], "doc_aggs": {}}
         if not question:
@@ -617,11 +627,46 @@ class Dealer:
             tenant_ids = tenant_ids.split(",")
 
         idx_names = [index_name(tid) for tid in tenant_ids]
-        sres = await self.search(req, idx_names, kb_ids, embd_mdl, highlight,
-                           rank_feature=rank_feature)
-        # Temporary retrieval-side guard: prune chunks whose parent document no
-        # longer exists before reranking and returning results.
-        sres = await self._prune_deleted_chunks(sres)
+        filter_attempts = []
+        filter_options = []
+        if isinstance(chunk_filters, list):
+            filter_options = [flt for flt in chunk_filters if isinstance(flt, dict) and flt]
+        elif isinstance(chunk_filters, dict) and chunk_filters:
+            filter_options = [chunk_filters]
+        if not filter_options:
+            filter_options = [None]
+
+        sres = None
+        for option in filter_options:
+            if option:
+                req["chunk_filters"] = option
+            else:
+                req.pop("chunk_filters", None)
+            sres = await self.search(req, idx_names, kb_ids, embd_mdl, highlight,
+                               rank_feature=rank_feature)
+            # Temporary retrieval-side guard: prune chunks whose parent document no
+            # longer exists before reranking and returning results.
+            sres = await self._prune_deleted_chunks(sres)
+            if option:
+                filter_attempts.append({"filters": option, "total": sres.total})
+            if sres.total > 0 or option is None:
+                break
+
+        if filter_attempts and sres and sres.total == 0 and chunk_filter_fallback_to_plain:
+            req.pop("chunk_filters", None)
+            sres = await self.search(req, idx_names, kb_ids, embd_mdl, highlight,
+                               rank_feature=rank_feature)
+            sres = await self._prune_deleted_chunks(sres)
+            filter_attempts.append({"filters": {}, "total": sres.total, "fallback": "plain"})
+
+        if filter_attempts:
+            ranks["entity_filter"] = {
+                **(chunk_filter_debug or {}),
+                "attempts": filter_attempts,
+                "selected_filters": req.get("chunk_filters") or {},
+                "fallback_to_plain": bool(filter_attempts[-1].get("fallback")) if filter_attempts else False,
+            }
+        assert sres is not None
         if sres.total == 0:
             ranks["doc_aggs"] = []
             return ranks

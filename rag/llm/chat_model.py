@@ -112,16 +112,61 @@ def _apply_model_family_policies(
     provider: SupportedLiteLLMProvider | str | None = None,
     gen_conf: dict | None = None,
     request_kwargs: dict | None = None,
+    thinking_config: dict | bool | None = None,
 ):
     model_name_lower = (model_name or "").lower()
     sanitized_gen_conf = deepcopy(gen_conf) if gen_conf else {}
     sanitized_kwargs = dict(request_kwargs) if request_kwargs else {}
 
-    # Qwen3 family disables thinking by extra_body on non-stream chat requests.
-    if "qwen3" in model_name_lower:
-        sanitized_kwargs["extra_body"] = {"enable_thinking": False}
+    # Determine if we should enable or disable thinking
+    is_stream = (
+        sanitized_gen_conf.get("stream", False)
+        or sanitized_kwargs.get("stream", False)
+        or (gen_conf is not None and "stream" in gen_conf)
+    )
+    reasoning_override = sanitized_kwargs.get("reasoning", sanitized_kwargs.get("with_reasoning"))
+    if reasoning_override is None:
+        reasoning_override = sanitized_gen_conf.get("reasoning", sanitized_gen_conf.get("with_reasoning"))
+    with_reasoning = True if reasoning_override is None else bool(reasoning_override)
+
+    supports_configured_thinking = bool(thinking_config)
+    is_qwen_reasoning_family = bool(re.search(r"(^|[/_-])qwen[/-]?qwen3(?:[.\-_]|$)|(^|[/_-])qwen3(?:[.\-_]|$)|qwq", model_name_lower))
+    is_builtin_reasoning_family = is_qwen_reasoning_family or "r1" in model_name_lower
+    should_control_thinking = reasoning_override is not None and (supports_configured_thinking or is_builtin_reasoning_family)
+
+    def _merge_extra_body(values: dict):
+        extra_body = sanitized_kwargs.get("extra_body")
+        if not isinstance(extra_body, dict):
+            extra_body = sanitized_gen_conf.get("extra_body")
+        if not isinstance(extra_body, dict):
+            extra_body = {}
+        extra_body.update(values)
+        sanitized_kwargs["extra_body"] = extra_body
+
+    # Qwen3 and DeepSeek-R1 families disable thinking by extra_body on non-stream chat requests,
+    # or when with_reasoning is explicitly False.
+    if is_builtin_reasoning_family:
+        if not is_stream or not with_reasoning:
+            if provider == SupportedLiteLLMProvider.Ollama or provider == "Ollama":
+                if backend == "litellm":
+                    # Ollama's OpenAI compatible /v1/chat/completions endpoint accepts "reasoning_effort": "none" to disable thinking
+                    sanitized_gen_conf["reasoning_effort"] = "none"
+                else:
+                    _merge_extra_body({"think": False})
+            else:
+                _merge_extra_body({"enable_thinking": False})
+        elif should_control_thinking:
+            if provider == SupportedLiteLLMProvider.Ollama or provider == "Ollama":
+                if backend != "litellm":
+                    _merge_extra_body({"think": True})
+            else:
+                _merge_extra_body({"enable_thinking": True})
+    elif should_control_thinking:
+        _merge_extra_body({"enable_thinking": with_reasoning})
 
     if backend == "base":
+        sanitized_kwargs.pop("reasoning", None)
+        sanitized_kwargs.pop("with_reasoning", None)
         return sanitized_gen_conf, sanitized_kwargs
 
     if backend == "litellm":
@@ -139,6 +184,8 @@ def _apply_model_family_policies(
                 sanitized_gen_conf.pop(key, None)
         elif "kimi-k2.5" in model_name_lower or "kimi-k2.6" in model_name_lower:
             reasoning = sanitized_gen_conf.pop("reasoning", None)
+            if reasoning is None:
+                reasoning = sanitized_kwargs.get("reasoning", sanitized_kwargs.get("with_reasoning"))
             thinking = {"type": "enabled"}
             if reasoning is not None:
                 thinking = {"type": "enabled"} if reasoning else {"type": "disabled"}
@@ -152,10 +199,17 @@ def _apply_model_family_policies(
             sanitized_gen_conf["n"] = 1
             sanitized_gen_conf["presence_penalty"] = 0.0
             sanitized_gen_conf["frequency_penalty"] = 0.0
+        elif should_control_thinking and provider == SupportedLiteLLMProvider.Anthropic:
+            sanitized_gen_conf["thinking"] = {"type": "enabled"} if with_reasoning else {"type": "disabled"}
 
+        sanitized_kwargs.pop("reasoning", None)
+        sanitized_kwargs.pop("with_reasoning", None)
         return sanitized_gen_conf, sanitized_kwargs
 
+    sanitized_kwargs.pop("reasoning", None)
+    sanitized_kwargs.pop("with_reasoning", None)
     return sanitized_gen_conf, sanitized_kwargs
+
 
 
 class Base(ABC):
@@ -164,6 +218,8 @@ class Base(ABC):
         self.client = OpenAI(api_key=key, base_url=base_url, timeout=timeout)
         self.async_client = AsyncOpenAI(api_key=key, base_url=base_url, timeout=timeout)
         self.model_name = model_name
+        self.provider = kwargs.get("provider", "")
+        self.thinking_config = kwargs.get("thinking")
         # Configure retry parameters
         self.max_retries = kwargs.get("max_retries", int(os.environ.get("LLM_MAX_RETRIES", 5)))
         self.base_delay = kwargs.get("retry_interval", float(os.environ.get("LLM_BASE_DELAY", 2.0)))
@@ -200,7 +256,9 @@ class Base(ABC):
         gen_conf, _ = _apply_model_family_policies(
             self.model_name,
             backend="base",
+            provider=self.provider,
             gen_conf=gen_conf,
+            thinking_config=self.thinking_config,
         )
 
         if "max_tokens" in gen_conf:
@@ -213,7 +271,16 @@ class Base(ABC):
         logging.info("[HISTORY STREAMLY]" + json.dumps(history, ensure_ascii=False, indent=4))
         reasoning_start = False
 
-        request_kwargs = {"model": self.model_name, "messages": history, "stream": True, **gen_conf}
+        policy_gen_conf, policy_kwargs = _apply_model_family_policies(
+            self.model_name,
+            backend="base",
+            provider=self.provider,
+            gen_conf=gen_conf,
+            request_kwargs={**kwargs, "stream": True},
+            thinking_config=self.thinking_config,
+        )
+        policy_kwargs.pop("stream", None)
+        request_kwargs = {"model": self.model_name, "messages": history, "stream": True, **policy_gen_conf, **policy_kwargs}
         stop = kwargs.get("stop")
         if stop:
             request_kwargs["stop"] = stop
@@ -622,7 +689,9 @@ class Base(ABC):
         _, kwargs = _apply_model_family_policies(
             self.model_name,
             backend="base",
+            provider=self.provider,
             request_kwargs=kwargs,
+            thinking_config=self.thinking_config,
         )
 
         response = await self.async_client.chat.completions.create(model=self.model_name, messages=history, **gen_conf, **kwargs)
@@ -1425,6 +1494,7 @@ class LiteLLMBase(ABC):
         self.provider = kwargs.get("provider", "")
         self.prefix = LITELLM_PROVIDER_PREFIX.get(self.provider, "")
         self.model_name = f"{self.prefix}{model_name}"
+        self.thinking_config = kwargs.get("thinking")
         self.api_key = key
         self.base_url = (base_url or FACTORY_DEFAULT_BASE_URL.get(self.provider, "")).rstrip("/")
         # Configure retry parameters
@@ -1488,6 +1558,7 @@ class LiteLLMBase(ABC):
             backend="litellm",
             provider=self.provider,
             gen_conf=gen_conf,
+            thinking_config=self.thinking_config,
         )
 
         gen_conf.pop("max_tokens", None)
@@ -1505,11 +1576,13 @@ class LiteLLMBase(ABC):
 
         logging.info("[HISTORY]" + json.dumps(hist, ensure_ascii=False, indent=2))
         gen_conf = self._clean_conf(gen_conf)
-        _, kwargs = _apply_model_family_policies(
+        gen_conf, kwargs = _apply_model_family_policies(
             self.model_name,
             backend="litellm",
             provider=self.provider,
+            gen_conf=gen_conf,
             request_kwargs=kwargs,
+            thinking_config=self.thinking_config,
         )
 
         completion_args = self._construct_completion_args(history=hist, stream=False, tools=False, **{**gen_conf, **kwargs})
@@ -1544,7 +1617,22 @@ class LiteLLMBase(ABC):
         reasoning_start = False
         total_tokens = 0
 
-        completion_args = self._construct_completion_args(history=history, stream=True, tools=False, **gen_conf)
+        # Apply model family policies for kwargs (with is_stream = True)
+        kwargs_copy = dict(kwargs)
+        kwargs_copy["stream"] = True
+        policy_gen_conf, policy_kwargs = _apply_model_family_policies(
+            self.model_name,
+            backend="litellm",
+            provider=self.provider,
+            gen_conf=gen_conf,
+            request_kwargs=kwargs_copy,
+            thinking_config=self.thinking_config,
+        )
+        policy_kwargs.pop("stream", None)
+        gen_conf_copy = dict(policy_gen_conf)
+        gen_conf_copy.pop("stream", None)
+
+        completion_args = self._construct_completion_args(history=history, stream=True, tools=False, **{**gen_conf_copy, **policy_kwargs})
         stop = kwargs.get("stop")
         if stop:
             completion_args["stop"] = stop

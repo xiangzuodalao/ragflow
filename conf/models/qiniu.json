@@ -356,7 +356,11 @@
     },
     {
       "name": "qwen/qwen3.5-plus",
-      "model_types": ["vision"]
+      "model_types": ["vision"],
+      "thinking": {
+        "default_value": true,
+        "clear_thinking": true
+      }
     },
     {
       "name": "qwen/qwen3.6-plus",

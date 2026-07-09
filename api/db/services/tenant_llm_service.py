@@ -185,6 +185,8 @@ class TenantLLMService(CommonService):
         from rag.llm import ChatModel, CvModel, EmbeddingModel, OcrModel, RerankModel, Seq2txtModel, TTSModel
 
         kwargs.update({"provider": model_config["llm_factory"]})
+        if model_config.get("thinking") is not None:
+            kwargs["thinking"] = model_config["thinking"]
         api_key = model_config.get("api_key_payload", model_config["api_key"])
         if model_config["model_type"] == LLMType.EMBEDDING.value:
             if model_config["llm_factory"] not in EmbeddingModel:

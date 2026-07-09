@@ -120,11 +120,29 @@ class _StreamingChatModel:
     def __init__(self, answer: str):
         self.answer = answer
         self.max_length = 8192
+        self.stream_calls = []
+        self.chat_calls = []
 
-    async def async_chat_streamly_delta(self, system_prompt, messages, gen_conf, **_kwargs):
+    async def async_chat_streamly_delta(self, system_prompt, messages, gen_conf, **kwargs):
+        self.stream_calls.append(
+            {
+                "system_prompt": system_prompt,
+                "messages": messages,
+                "gen_conf": gen_conf,
+                "kwargs": kwargs,
+            }
+        )
         yield self.answer
 
-    async def async_chat(self, system_prompt, messages, gen_conf, **_kwargs):
+    async def async_chat(self, system_prompt, messages, gen_conf, **kwargs):
+        self.chat_calls.append(
+            {
+                "system_prompt": system_prompt,
+                "messages": messages,
+                "gen_conf": gen_conf,
+                "kwargs": kwargs,
+            }
+        )
         return self.answer
 
 
@@ -448,6 +466,76 @@ def test_async_chat_final_event_carries_decorated_answer(monkeypatch):
 
     assert "answer" in final
     assert "reference" in final
+
+
+@pytest.mark.p2
+def test_async_chat_request_reasoning_false_overrides_prompt_config(monkeypatch):
+    """The per-message Thinking toggle must be able to turn reasoning off."""
+    chat_mdl = _StreamingChatModel("RAGFlow answers without deep research.")
+    retriever = _StubRetriever()
+
+    monkeypatch.setattr(
+        dialog_service, "get_model_type_by_name",
+        lambda _tid, _llm_id: ["chat"],
+    )
+    monkeypatch.setattr(
+        dialog_service,
+        "get_model_config_from_provider_instance",
+        lambda _tid, _type, _llm_id: _LLM_CONFIG,
+    )
+    monkeypatch.setattr(
+        dialog_service.TenantLangfuseService,
+        "filter_by_tenant",
+        lambda tenant_id: None,
+    )
+    monkeypatch.setattr(
+        dialog_service,
+        "get_models",
+        lambda _dialog, **_kwargs: ([_KB], chat_mdl, None, chat_mdl, None),
+    )
+    monkeypatch.setattr(
+        dialog_service.KnowledgebaseService,
+        "get_field_map",
+        lambda _kb_ids: {},
+    )
+    monkeypatch.setattr(
+        dialog_service.KnowledgebaseService,
+        "get_by_ids",
+        lambda _ids: [_KB],
+    )
+    monkeypatch.setattr(dialog_service.settings, "retriever", retriever, raising=False)
+    monkeypatch.setattr(dialog_service, "label_question", lambda _q, _kbs: "")
+    monkeypatch.setattr(
+        dialog_service,
+        "kb_prompt",
+        lambda _kbinfos, _max_tokens, **_kw: ["RAGFlow is a RAG engine."],
+    )
+
+    class _UnexpectedDeepResearcher:
+        def __init__(self, *_args, **_kwargs):
+            raise AssertionError("DeepResearcher should not run when reasoning is false")
+
+    monkeypatch.setattr(dialog_service, "DeepResearcher", _UnexpectedDeepResearcher)
+
+    dialog = _make_dialog(chat_mdl)
+    dialog.prompt_config["reasoning"] = True
+    messages = [{"role": "user", "content": "V-SZ-C-2002打螺丝时摩擦力超时怎么办"}]
+
+    events = _collect(
+        dialog_service.async_chat(
+            dialog,
+            messages,
+            stream=True,
+            quote=True,
+            reasoning=False,
+        )
+    )
+
+    assert any(e.get("final") is True for e in events)
+    assert chat_mdl.stream_calls
+    model_kwargs = chat_mdl.stream_calls[0]["kwargs"]
+    assert model_kwargs["reasoning"] is False
+    assert model_kwargs["with_reasoning"] is False
 
 
 @pytest.mark.p2

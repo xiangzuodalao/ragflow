@@ -45,6 +45,7 @@ from common.text_utils import normalize_arabic_digits
 from rag.graphrag.general.mind_map_extractor import MindMapExtractor
 from rag.advanced_rag import DeepResearcher
 from rag.app.tag import label_question
+from rag.nlp.table_entity_filter import build_table_entity_filter, table_entity_filter_enabled
 from rag.nlp.search import index_name
 from rag.prompts.generator import chunks_format, citation_prompt, cross_languages, full_question, kb_prompt, keyword_extraction, message_fit_in, PROMPT_JINJA_ENV, ASK_SUMMARY
 from common.token_utils import num_tokens_from_string
@@ -52,6 +53,43 @@ from rag.utils.tavily_conn import Tavily
 from rag.utils.tts_cache import synthesize_with_cache
 from common.string_utils import remove_redundant_spaces
 from common import settings
+
+
+def _coerce_bool(value):
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "on"}
+    return bool(value)
+
+
+def _resolve_reasoning_enabled(prompt_config, request_payload=None):
+    request_payload = request_payload or {}
+    if "reasoning" in request_payload and request_payload["reasoning"] is not None:
+        return _coerce_bool(request_payload["reasoning"])
+    return _coerce_bool(prompt_config.get("reasoning", False))
+
+
+def _reasoning_model_kwargs(reasoning_enabled):
+    return {
+        "reasoning": reasoning_enabled,
+        "with_reasoning": reasoning_enabled,
+    }
+
+
+def _sql_retrieval_enabled(prompt_config, request_payload=None, kbs=None):
+    request_payload = request_payload or {}
+    # Explicit enable takes priority. Note: disable_sql_retrieval=False is NOT an explicit
+    # enable (only True disables), so it falls through to the entity-filter check below.
+    for source in (request_payload, prompt_config or {}):
+        if "enable_sql_retrieval" in source:
+            return _coerce_bool(source.get("enable_sql_retrieval"))
+    for source in (request_payload, prompt_config or {}):
+        if _coerce_bool(source.get("disable_sql_retrieval", False)):
+            return False
+    # When entity filter is active for table KBs, use RAG+filter instead of SQL retrieval
+    if table_entity_filter_enabled(prompt_config, request_payload, kbs=kbs):
+        return False
+    return True
+
 
 def _chunk_kb_id_for_doc(row_dict, kb_ids, doc_id):
     if len(kb_ids or []) == 1:
@@ -286,7 +324,7 @@ class DialogService(CommonService):
         return list(objs)
 
 
-async def async_chat_solo(dialog, messages, stream=True, session_id=None):
+async def async_chat_solo(dialog, messages, stream=True, session_id=None, **kwargs):
     llm_types = get_model_type_by_name(dialog.tenant_id, dialog.llm_id)
     attachments = ""
     image_attachments = []
@@ -307,6 +345,8 @@ async def async_chat_solo(dialog, messages, stream=True, session_id=None):
     factory = model_config.get("llm_factory", "") if model_config else ""
 
     prompt_config = dialog.prompt_config
+    reasoning_enabled = _resolve_reasoning_enabled(prompt_config, kwargs)
+    model_kwargs = _reasoning_model_kwargs(reasoning_enabled)
     tts_mdl = None
     if prompt_config.get("tts"):
         default_tts_model = get_tenant_default_model_by_type(dialog.tenant_id, LLMType.TTS)
@@ -318,9 +358,9 @@ async def async_chat_solo(dialog, messages, stream=True, session_id=None):
         convert_last_user_msg_to_multimodal(msg, image_attachments, factory)
     if stream:
         if "chat" in llm_types:
-            stream_iter = chat_mdl.async_chat_streamly_delta(prompt_config.get("system", ""), msg, dialog.llm_setting)
+            stream_iter = chat_mdl.async_chat_streamly_delta(prompt_config.get("system", ""), msg, dialog.llm_setting, **model_kwargs)
         else:
-            stream_iter = chat_mdl.async_chat_streamly_delta(prompt_config.get("system", ""), msg, dialog.llm_setting, images=image_files)
+            stream_iter = chat_mdl.async_chat_streamly_delta(prompt_config.get("system", ""), msg, dialog.llm_setting, images=image_files, **model_kwargs)
         async for kind, value, state in _stream_with_think_delta(stream_iter):
             if kind == "marker":
                 flags = {"start_to_think": True} if value == "<think>" else {"end_to_think": True}
@@ -329,9 +369,9 @@ async def async_chat_solo(dialog, messages, stream=True, session_id=None):
             yield {"answer": value, "reference": {}, "audio_binary": tts(tts_mdl, value), "prompt": "", "created_at": time.time(), "final": False}
     else:
         if "chat" in llm_types:
-            answer = await chat_mdl.async_chat(prompt_config.get("system", ""), msg, dialog.llm_setting)
+            answer = await chat_mdl.async_chat(prompt_config.get("system", ""), msg, dialog.llm_setting, **model_kwargs)
         else:
-            answer = await chat_mdl.async_chat(prompt_config.get("system", ""), msg, dialog.llm_setting, images=image_files)
+            answer = await chat_mdl.async_chat(prompt_config.get("system", ""), msg, dialog.llm_setting, images=image_files, **model_kwargs)
         user_content = msg[-1].get("content", "[content not available]")
         logging.debug("User: {}|Assistant: {}".format(user_content, answer))
         yield {"answer": answer, "reference": {}, "audio_binary": tts(tts_mdl, answer), "prompt": "", "created_at": time.time()}
@@ -545,7 +585,7 @@ async def async_chat(dialog, messages, stream=True, **kwargs):
     use_web_search = _should_use_web_search(dialog.prompt_config, kwargs.get("internet"))
     logging.debug("web_search kb=%s tavily=%s internet=%r enabled=%s", bool(dialog.kb_ids), bool(dialog.prompt_config.get("tavily_api_key")), kwargs.get("internet"), use_web_search)
     if not dialog.kb_ids and not use_web_search:
-        async for ans in async_chat_solo(dialog, messages, stream, session_id=session_id):
+        async for ans in async_chat_solo(dialog, messages, stream, session_id=session_id, **kwargs):
             yield ans
         return
 
@@ -604,11 +644,21 @@ async def async_chat(dialog, messages, stream=True, **kwargs):
         attachments_ = "\n\n".join(text_attachments)
 
     prompt_config = dialog.prompt_config
+    reasoning_enabled = _resolve_reasoning_enabled(prompt_config, kwargs)
+    model_kwargs = _reasoning_model_kwargs(reasoning_enabled)
     include_reference_metadata, metadata_fields = _resolve_reference_metadata(prompt_config, request_payload=kwargs)
     field_map = KnowledgebaseService.get_field_map(dialog.kb_ids)
     logging.debug(f"field_map retrieved: {field_map}")
     # try to use sql if field mapping is good to go
-    if field_map:
+    _sql_enabled = _sql_retrieval_enabled(prompt_config, kwargs, kbs=kbs)
+    logging.info(
+        "retrieval routing: sql_enabled=%s table_entity_filter_enabled=%s prompt_keys=%s request_keys=%s",
+        _sql_enabled,
+        table_entity_filter_enabled(prompt_config, kwargs, kbs=kbs),
+        sorted((prompt_config or {}).keys()),
+        sorted((kwargs or {}).keys()),
+    )
+    if field_map and _sql_enabled:
         logging.debug("Use SQL to retrieval:{}".format(questions[-1]))
         ans = await use_sql(questions[-1], field_map, dialog.tenant_id, chat_mdl, prompt_config.get("quote", True), dialog.kb_ids)
         # For aggregate queries (COUNT, SUM, etc.), chunks may be empty but answer is still valid
@@ -649,6 +699,14 @@ async def async_chat(dialog, messages, stream=True, **kwargs):
     if prompt_config.get("cross_languages"):
         questions = [await cross_languages(dialog.tenant_id, dialog.llm_id, questions[0], prompt_config["cross_languages"])]
 
+    table_entity_plan = build_table_entity_filter(
+        " ".join(questions),
+        kbs,
+        field_map,
+        prompt_config,
+        kwargs,
+    )
+
     if dialog.meta_data_filter:
         attachments = await apply_meta_data_filter(
             dialog.meta_data_filter,
@@ -672,7 +730,7 @@ async def async_chat(dialog, messages, stream=True, **kwargs):
         logging.debug("Proceeding with retrieval")
         tenant_ids = list(set([kb.tenant_id for kb in kbs]))
         knowledges = []
-        if prompt_config.get("reasoning", False) or kwargs.get("reasoning"):
+        if reasoning_enabled:
             reasoner = DeepResearcher(
                 chat_mdl,
                 prompt_config,
@@ -686,6 +744,8 @@ async def async_chat(dialog, messages, stream=True, **kwargs):
                     similarity_threshold=0.2,
                     vector_similarity_weight=0.3,
                     doc_ids=attachments,
+                    chunk_filters=table_entity_plan.filters if table_entity_plan else None,
+                    chunk_filter_debug=table_entity_plan.debug if table_entity_plan else None,
                 ),
                 internet_enabled=use_web_search,
             )
@@ -725,6 +785,8 @@ async def async_chat(dialog, messages, stream=True, **kwargs):
                     aggs=True,
                     rerank_mdl=rerank_mdl,
                     rank_feature=label_question(" ".join(questions), kbs),
+                    chunk_filters=table_entity_plan.filters if table_entity_plan else None,
+                    chunk_filter_debug=table_entity_plan.debug if table_entity_plan else None,
                 )
                 if prompt_config.get("toc_enhance"):
                     cks = await retriever.retrieval_by_toc(" ".join(questions), kbinfos["chunks"], tenant_ids, chat_mdl, dialog.top_n)
@@ -886,9 +948,9 @@ async def async_chat(dialog, messages, stream=True, **kwargs):
 
     if stream:
         if llm_model_config["model_type"] == "chat":
-            stream_iter = chat_mdl.async_chat_streamly_delta(prompt + prompt4citation, msg[1:], gen_conf)
+            stream_iter = chat_mdl.async_chat_streamly_delta(prompt + prompt4citation, msg[1:], gen_conf, **model_kwargs)
         else:
-            stream_iter = chat_mdl.async_chat_streamly_delta(prompt + prompt4citation, msg[1:], gen_conf, images=image_files)
+            stream_iter = chat_mdl.async_chat_streamly_delta(prompt + prompt4citation, msg[1:], gen_conf, images=image_files, **model_kwargs)
         last_state = None
         async for kind, value, state in _stream_with_think_delta(stream_iter):
             last_state = state
@@ -906,9 +968,9 @@ async def async_chat(dialog, messages, stream=True, **kwargs):
             yield final
     else:
         if llm_model_config["model_type"] == "chat":
-            answer = await chat_mdl.async_chat(prompt + prompt4citation, msg[1:], gen_conf)
+            answer = await chat_mdl.async_chat(prompt + prompt4citation, msg[1:], gen_conf, **model_kwargs)
         else:
-            answer = await chat_mdl.async_chat(prompt + prompt4citation, msg[1:], gen_conf, images=image_files)
+            answer = await chat_mdl.async_chat(prompt + prompt4citation, msg[1:], gen_conf, images=image_files, **model_kwargs)
         user_content = msg[-1].get("content", "[content not available]")
         logging.debug("User: {}|Assistant: {}".format(user_content, answer))
         res = await decorate_answer(answer)
@@ -1629,6 +1691,14 @@ async def async_ask(question, kb_ids, tenant_id, chat_llm_name=None, search_conf
         rerank_mdl = LLMBundle(tenant_id, rerank_model_config)
     max_tokens = chat_mdl.max_length
     tenant_ids = list(set([kb.tenant_id for kb in kbs]))
+    field_map = KnowledgebaseService.get_field_map(kb_ids)
+    table_entity_plan = build_table_entity_filter(
+        question,
+        kbs,
+        field_map,
+        search_config,
+        search_config,
+    )
 
     if meta_data_filter:
         doc_ids = await apply_meta_data_filter(
@@ -1671,6 +1741,8 @@ async def async_ask(question, kb_ids, tenant_id, chat_llm_name=None, search_conf
         rerank_mdl=rerank_mdl,
         rank_feature=label_question(question, kbs),
         trace_id=search_id,
+        chunk_filters=table_entity_plan.filters if table_entity_plan else None,
+        chunk_filter_debug=table_entity_plan.debug if table_entity_plan else None,
     )
     if include_reference_metadata:
         logging.debug(
@@ -1755,6 +1827,15 @@ async def gen_mindmap(question, kb_ids, tenant_id, search_config={}):
             metas_loader=lambda: DocMetadataService.get_flatted_meta_by_kbs(kb_ids),
         )
 
+    field_map = KnowledgebaseService.get_field_map(kb_ids)
+    table_entity_plan = build_table_entity_filter(
+        question,
+        kbs,
+        field_map,
+        search_config,
+        search_config,
+    )
+
     ranks = await settings.retriever.retrieval(
         question=question,
         embd_mdl=embd_mdl,
@@ -1769,6 +1850,8 @@ async def gen_mindmap(question, kb_ids, tenant_id, search_config={}):
         aggs=False,
         rerank_mdl=rerank_mdl,
         rank_feature=label_question(question, kbs),
+        chunk_filters=table_entity_plan.filters if table_entity_plan else None,
+        chunk_filter_debug=table_entity_plan.debug if table_entity_plan else None,
     )
     mindmap = MindMapExtractor(chat_mdl)
     mind_map = await mindmap([c["content_with_weight"] for c in ranks["chunks"]])
