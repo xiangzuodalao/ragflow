@@ -48,6 +48,15 @@ def normalize_base_url(base_url: str) -> str:
     return base_url
 
 
+CONCISE_TABLE_PROMPT = (
+    "你是设备故障维修知识库助手。根据以下知识回答问题，只回答被问到的内容，用最简短的形式："
+    "问字段值(设备名称/故障描述/步骤内容/维修方法/判定标准等)只给该值；"
+    "问某步骤只给该步骤；问完整处理流程则按步骤序号完整列出每步的步骤内容、维修方法、判定标准与标准时间；"
+    "问对比或边界用简短要点。不复述问题，不补充未询问的信息。"
+    "答案正文不要主动添加引用说明。无法确定时直接说明。\n\n知识：\n{knowledge}"
+)
+
+
 class RAGFlowClient:
     def __init__(self, base_url: str, api_key: str) -> None:
         try:
@@ -74,6 +83,8 @@ class RAGFlowClient:
         prompt_config: dict[str, Any] = {"enable_table_entity_filter": not args.disable_table_entity_filter}
         if args.disable_sql_retrieval:
             prompt_config["disable_sql_retrieval"] = True
+        if getattr(args, "concise_prompt", False):
+            prompt_config["system"] = CONCISE_TABLE_PROMPT
         payload = {
             "name": name,
             "dataset_ids": dataset_ids,
@@ -458,6 +469,258 @@ def records_from_raw_responses(raw_rows: list[dict[str, Any]], samples: list[dic
     return records
 
 
+# ---------------------------------------------------------------------------
+# v7 scoring helpers: answer normalization + custom table-KB metrics.
+# Normalization only strips formatting/citation/preamble - never answer
+# content - so the eval stays honest ("不失真"). Raw responses are untouched.
+# ---------------------------------------------------------------------------
+
+_CITATION_PATTERNS = [
+    re.compile(r"\[\s*ID\s*[: ]*\s*\d+\s*\]"),      # [ID: 12]
+    re.compile(r"【\s*ID\s*[: ]*\s*\d+\s*\】"),      # 【ID: 12】
+    re.compile(r"\(\s*ID\s*[: ]*\s*\d+\s*\)"),      # (ID: 12)
+    re.compile(r"##\d+\$+"),                         # SQL row citation ##0$$
+]
+_PREAMBLE_RE = re.compile(
+    r"^(?:根据|据)(?:知识库|提供的信息|上述信息|提供的数据|数据集|以下信息|参考资料|上述资料)[，,。：:?？\s]*"
+)
+_MARKDOWN_BOLD_RE = re.compile(r"\*\*(.+?)\*\*")
+_MARKDOWN_UNDERLINE_RE = re.compile(r"__(.+?)__")
+_MARKDOWN_ITALIC_RE = re.compile(r"(?<!\*)\*([^*\n]+?)\*(?!\*)")
+# aggressive match normalization: lowercase, drop all whitespace + punctuation
+_MATCH_STRIP_RE = re.compile(r"[\W_]+")  # drop all non-word chars + underscore, keep CJK/alphanumerics
+
+_GT_LABEL_RE = re.compile(
+    r"^(?:步骤序号\d+的步骤内容|步骤内容|维修方法|判定标准|设备名称|故障描述|故障类别|步骤序号|标准时间)\s*[是为：:=]\s*"
+)
+_GT_NUM_RE = re.compile(r"^\s*\d+\s*[.、)]\s*")
+_GT_TAIL_TIME_RE = re.compile(r"[,，]?\s*标准时间\s*[：:]\s*\d+\s*$")
+_GT_PREAMBLE_HINTS = ("按以下步骤处理", "处理步骤如下", "步骤如下")
+
+_DEVICE_CODE_RE = re.compile(r"V-SZ-[A-Za-z0-9]+(?:[- ][A-Za-z0-9]+)*")
+_FAULT_CODE_RE = re.compile(r"[A-Z]{2,3}_WC\d+_\d+")
+_STEP_CONTENT_RE = re.compile(r"步骤内容\s*[:：]\s*([^-\n]+?)(?:\s+-\s|\n|$)")
+
+
+def normalize_answer_for_scoring(answer: str) -> str:
+    """Strip citations / markdown / leading preamble for fairer Ragas scoring.
+
+    Never removes answer content - only formatting and citation markers.
+    """
+    if not answer:
+        return ""
+    s = answer
+    for pat in _CITATION_PATTERNS:
+        s = pat.sub("", s)
+    s = _MARKDOWN_BOLD_RE.sub(r"\1", s)
+    s = _MARKDOWN_UNDERLINE_RE.sub(r"\1", s)
+    s = _MARKDOWN_ITALIC_RE.sub(r"\1", s)
+    s = _PREAMBLE_RE.sub("", s)
+    s = re.sub(r"\n{3,}", "\n\n", s)
+    return s.strip()
+
+
+def normalize_for_match(text: str) -> str:
+    """Aggressive normalization for substring matching (Chinese-safe, no word boundaries)."""
+    if not text:
+        return ""
+    return _MATCH_STRIP_RE.sub("", text.lower())
+
+
+def extract_gt_core_values(gt: str) -> list[str]:
+    """Split a ground-truth string into its core factual values.
+
+    Field questions yield one value; multi-step questions yield the per-step
+    步骤内容/维修方法/判定标准 values. Preamble/context sentences are skipped.
+    """
+    if not gt:
+        return []
+    text = gt.replace("；", "\n").replace(";", "\n").replace("。", "\n")
+    values: list[str] = []
+    for raw in text.split("\n"):
+        line = raw.strip()
+        if not line:
+            continue
+        if any(hint in line for hint in _GT_PREAMBLE_HINTS):
+            continue
+        line = _GT_NUM_RE.sub("", line)
+        line = _GT_LABEL_RE.sub("", line)
+        line = _GT_TAIL_TIME_RE.sub("", line)
+        line = line.strip().strip("。.，,：:；;")
+        if not line or re.fullmatch(r"\d+", line):
+            continue
+        # skip bare device/fault context lines (no content field)
+        if "设备编码" in line and "步骤内容" not in line and "维修方法" not in line:
+            continue
+        values.append(line)
+    return values
+
+
+def _extract_expected_device(question: str, expected_evidence: str) -> str:
+    for source in (question, expected_evidence):
+        m = _DEVICE_CODE_RE.search(source or "")
+        if m:
+            return m.group(0)
+    return ""
+
+
+def _extract_expected_fault(question: str, expected_evidence: str) -> str:
+    for source in (question, expected_evidence):
+        m = _FAULT_CODE_RE.search(source or "")
+        if m:
+            return m.group(0)
+    return ""
+
+
+def _expected_hard(question: str, category: str) -> bool:
+    """Conservative ambiguity flag: open-ended fact question with no specific entity.
+
+    Based on the QUESTION only (not expected_evidence) so a vague question isn't
+    rescued by the evidence's device code.
+    """
+    if category != "fact":
+        return False
+    q = question or ""
+    if _DEVICE_CODE_RE.search(q) or _FAULT_CODE_RE.search(q):
+        return False
+    if re.search(r"产线|line\d|LINE\d", q, re.IGNORECASE):
+        return False
+    return bool(re.search(r"是什么|有哪些|描述是什么|是什么内容", q))
+
+
+def compute_custom_metrics(record: dict[str, Any]) -> dict[str, Any]:
+    """Table-KB-specific metrics that complement Ragas. None = N/A (not applicable)."""
+    question = record.get("question", "") or ""
+    gt = record.get("ground_truth", "") or ""
+    evidence = record.get("expected_evidence", "") or ""
+    category = record.get("category", "") or ""
+    answer_raw = record.get("answer", "") or ""
+    answer_match = normalize_for_match(normalize_answer_for_scoring(answer_raw))
+    contexts = record.get("contexts") or []
+    contexts_match = normalize_for_match(" ".join(str(c) for c in contexts))
+
+    device = _extract_expected_device(question, evidence)
+    fault = _extract_expected_fault(question, evidence)
+    dev_m = normalize_for_match(device)
+    flt_m = normalize_for_match(fault)
+
+    # answer_contains_ground_truth: hit-rate over GT core values (not boolean for multi-value)
+    core_values = extract_gt_core_values(gt)
+    if core_values:
+        hits = sum(
+            1 for v in core_values
+            if normalize_for_match(v) and normalize_for_match(v) in answer_match
+        )
+        acgt = hits / len(core_values)
+    else:
+        acgt = 0.0
+
+    # field_exact_match: normalized substring (no word boundary - Chinese-safe)
+    first_val = normalize_for_match(core_values[0]) if core_values else ""
+    fem = 1.0 if (first_val and first_val in answer_match) else 0.0
+
+    # device / fault split into context vs answer (None when no entity to match)
+    if dev_m:
+        device_context_match = 1.0 if dev_m in contexts_match else 0.0
+        device_answer_match = 1.0 if dev_m in answer_match else 0.0
+    else:
+        device_context_match = None
+        device_answer_match = None
+    if flt_m:
+        fault_context_match = 1.0 if flt_m in contexts_match else 0.0
+        fault_answer_match = 1.0 if flt_m in answer_match else 0.0
+    else:
+        fault_context_match = None
+        fault_answer_match = None
+
+    # step_coverage: fraction of expected 步骤内容 values present in the answer.
+    # Only meaningful for multi-step procedure questions; None otherwise.
+    if category == "full_troubleshooting":
+        step_values = [re.sub(r"^\s*\d+\s*[.、)]\s*", "", s).strip() for s in _STEP_CONTENT_RE.findall(evidence)]
+        step_values = [s for s in step_values if s]
+        if step_values:
+            covered = sum(
+                1 for s in step_values
+                if normalize_for_match(s) and normalize_for_match(s) in answer_match
+            )
+            step_coverage = covered / len(step_values)
+        else:
+            step_coverage = None
+    else:
+        step_coverage = None
+
+    return {
+        "answer_contains_ground_truth": round(acgt, 4),
+        "field_exact_match": fem,
+        "device_context_match": device_context_match,
+        "device_answer_match": device_answer_match,
+        "fault_context_match": fault_context_match,
+        "fault_answer_match": fault_answer_match,
+        "step_coverage": step_coverage,
+        "expected_hard": _expected_hard(question, category),
+        "category": category,
+        "device": device,
+        "fault": fault,
+    }
+
+
+CUSTOM_METRIC_COLUMNS = [
+    "answer_contains_ground_truth",
+    "field_exact_match",
+    "device_context_match",
+    "device_answer_match",
+    "fault_context_match",
+    "fault_answer_match",
+    "step_coverage",
+]
+
+
+def write_custom_metrics(records: list[dict[str, Any]], path: Path) -> None:
+    fieldnames = ["sample_id", "category", "expected_hard", "device", "fault"] + CUSTOM_METRIC_COLUMNS
+    with path.open("w", encoding="utf-8", newline="") as file:
+        writer = csv.DictWriter(file, fieldnames=fieldnames)
+        writer.writeheader()
+        for record in records:
+            cm = record.get("custom_metrics") or {}
+            row = {
+                "sample_id": record["sample_id"],
+                "category": cm.get("category", ""),
+                "expected_hard": cm.get("expected_hard", ""),
+                "device": cm.get("device", ""),
+                "fault": cm.get("fault", ""),
+            }
+            for col in CUSTOM_METRIC_COLUMNS:
+                v = cm.get(col)
+                row[col] = "" if v is None else v
+            writer.writerow(row)
+
+
+def _mean(values: list[float]) -> float | None:
+    values = [v for v in values if v is not None]
+    return round(statistics.fmean(values), 4) if values else None
+
+
+def aggregate_custom_metrics(records: list[dict[str, Any]]) -> dict[str, Any]:
+    """Overall + per-category + main-cohort means for custom metrics."""
+    def cohort(rs: list[dict[str, Any]]) -> dict[str, float | None]:
+        out = {}
+        for col in CUSTOM_METRIC_COLUMNS:
+            out[col] = _mean([(r.get("custom_metrics") or {}).get(col) for r in rs])
+        return out
+
+    by_cat: dict[str, list[dict[str, Any]]] = {}
+    for r in records:
+        by_cat.setdefault((r.get("custom_metrics") or {}).get("category", ""), []).append(r)
+    category_means = {c: cohort(rs) for c, rs in by_cat.items() if c}
+    main = [r for r in records if not (r.get("custom_metrics") or {}).get("expected_hard")]
+    return {
+        "metric_means": cohort(records),
+        "category_means": category_means,
+        "main_cohort_metric_means": cohort(main),
+        "main_cohort_count": len(main),
+    }
+
+
 def make_ragas_dataset(records: list[dict[str, Any]]) -> Any:
     try:
         from datasets import Dataset
@@ -469,14 +732,16 @@ def make_ragas_dataset(records: list[dict[str, Any]]) -> Any:
     rows = []
     for record in records:
         reference = record.get("ground_truth") or record["expected_evidence"]
+        normalized = normalize_answer_for_scoring(record["answer"])
+        record["_answer_normalized"] = normalized  # cached for scores.csv response_raw
         rows.append(
             {
                 "user_input": record["question"],
-                "response": record["answer"],
+                "response": normalized,
                 "retrieved_contexts": record["contexts"],
                 "reference": reference,
                 "question": record["question"],
-                "answer": record["answer"],
+                "answer": normalized,
                 "contexts": record["contexts"],
                 "ground_truth": reference,
                 "sample_id": record["sample_id"],
@@ -539,6 +804,7 @@ def is_metric_column(column: str) -> bool:
     return column not in {
         "user_input",
         "response",
+        "response_raw",
         "retrieved_contexts",
         "reference",
         "question",
@@ -550,6 +816,7 @@ def is_metric_column(column: str) -> bool:
         "context_count",
         "retry_count",
         "context_extraction_source",
+        "expected_hard",
     }
 
 
@@ -618,21 +885,42 @@ def run_ragas(records: list[dict[str, Any]], scores_path: Path) -> dict[str, Any
             df.loc[idx, "context_count"] = len(record["contexts"])
             df.loc[idx, "retry_count"] = record.get("retry_count", 0)
             df.loc[idx, "context_extraction_source"] = record.get("context_extraction", {}).get("extraction_source", "")
+            df.loc[idx, "response_raw"] = record.get("answer", "")
+            df.loc[idx, "expected_hard"] = bool((record.get("custom_metrics") or {}).get("expected_hard", False))
         df.to_csv(scores_path, index=False)
-        metric_means = {}
-        for column in df.columns:
-            if not is_metric_column(column):
-                continue
+
+        metric_columns = [c for c in df.columns if is_metric_column(c)]
+
+        def _col_mean(series: Any) -> float | None:
             try:
-                values = [float(v) for v in df[column].dropna().tolist()]
+                vals = [float(v) for v in series.dropna().tolist()]
             except (TypeError, ValueError):
-                continue
-            if values:
-                metric_means[column] = statistics.fmean(values)
-    except Exception:
+                return None
+            return round(statistics.fmean(vals), 4) if vals else None
+
+        metric_means = {k: v for k, v in ((c, _col_mean(df[c])) for c in metric_columns) if v is not None}
+
+        category_means: dict[str, Any] = {}
+        for cat, group in df.groupby("category"):
+            means = {k: v for k, v in ((c, _col_mean(group[c])) for c in metric_columns) if v is not None}
+            category_means[str(cat)] = means
+
+        main_df = df[~df["expected_hard"].astype(bool)] if "expected_hard" in df.columns else df
+        main_cohort = {k: v for k, v in ((c, _col_mean(main_df[c])) for c in metric_columns) if v is not None}
+    except Exception as exc:
+        import traceback
+        print(f"WARNING: run_ragas post-processing failed: {exc!r}", file=sys.stderr)
+        traceback.print_exc(file=sys.stderr)
         scores_path.write_text(str(result), encoding="utf-8")
         metric_means = {}
-    return {"metric_means": metric_means, "result": str(result)}
+        category_means = {}
+        main_cohort = {}
+    return {
+        "metric_means": metric_means,
+        "category_means": category_means,
+        "main_cohort_metric_means": main_cohort,
+        "result": str(result),
+    }
 
 
 def write_fallback_scores(records: list[dict[str, Any]], scores_path: Path) -> None:
@@ -690,6 +978,11 @@ def build_summary(records: list[dict[str, Any]], ragas_summary: dict[str, Any] |
         for record in records
         if record.get("context_extraction", {}).get("extraction_source") == "empty_reference_chunks"
     ]
+    expected_hard_ids = [
+        record["sample_id"]
+        for record in records
+        if (record.get("custom_metrics") or {}).get("expected_hard")
+    ]
     return {
         "sample_count": len(records),
         "no_context_count": len(no_context),
@@ -704,6 +997,9 @@ def build_summary(records: list[dict[str, Any]], ragas_summary: dict[str, Any] |
         "empty_reference_chunks_sample_ids": empty_reference_chunks[:20],
         "latency_seconds_avg": statistics.fmean(elapsed) if elapsed else None,
         "latency_seconds_p50": statistics.median(elapsed) if elapsed else None,
+        "expected_hard_count": len(expected_hard_ids),
+        "expected_hard_sample_ids": expected_hard_ids,
+        "custom_metrics": aggregate_custom_metrics(records),
         "ragas": ragas_summary or {},
     }
 
@@ -731,6 +1027,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--disable-retrieval-fallback", action="store_true")
     parser.add_argument("--disable-table-entity-filter", action="store_true")
     parser.add_argument("--disable-sql-retrieval", action="store_true")
+    parser.add_argument(
+        "--concise-prompt",
+        action="store_true",
+        help="Use a concise, question-type-adaptive system prompt (v7). Default off (v6 behavior).",
+    )
     return parser
 
 
@@ -785,6 +1086,11 @@ def main() -> int:
     if not records:
         raise SystemExit("No successful RAGFlow responses were collected.")
 
+    custom_metrics_path = output_dir / "custom_metrics.csv"
+    for record in records:
+        record["custom_metrics"] = compute_custom_metrics(record)
+    write_custom_metrics(records, custom_metrics_path)
+
     ragas_summary = None
     if args.skip_ragas:
         write_fallback_scores(records, scores_path)
@@ -805,6 +1111,7 @@ def main() -> int:
     summary_path.write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
     print(f"Wrote raw responses to {raw_path}")
     print(f"Wrote scores to {scores_path}")
+    print(f"Wrote custom metrics to {custom_metrics_path}")
     print(f"Wrote summary to {summary_path}")
     print(json.dumps(summary, ensure_ascii=False, indent=2))
     return 0

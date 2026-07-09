@@ -122,9 +122,17 @@ def _strip_value(value: str) -> str:
 # e.g. “NQ_WC120_036，12213 NG” -> 12213 NG. The pattern matches ASCII ["'] only,
 # so smart quotes wrapping the value are also trimmed here.
 _FAULT_CODE_PREFIX = re.compile(
-    '^[“”‘’"\']*\\s*[A-Z]{2,3}_WC\\d+_\\d+\\s*[，,；;:：]\\s*'
+    '^[“”‘’"\']*\\s*[A-Z]{2,3}_WC[A-Z0-9]+_[A-Z0-9]+\\s*[，,；;:：]\\s*'
 )
 _VALUE_QUOTES = "“”‘’\"' "
+
+
+# Canonical fault-code patterns. WC segments are alphanumeric, not pure digits,
+# so codes like BD_WC73OP27_8809 (WC segment "73OP27" contains letters) match.
+_FAULT_CODE_WC_PATTERN = r"([A-Z]{2,3}_WC[A-Z0-9]+_[A-Z0-9]+)"
+# Bare N/P/B codes (DRS 故障描述 style). Bounded - no greedy \S* - so it captures
+# just the code (e.g. "N504"), not trailing description text.
+_FAULT_CODE_BARE_PATTERN = r"([NBP]\d{3,6}[A-Z]?)"
 
 
 def _clean_fault_desc(value: str) -> str:
@@ -221,7 +229,7 @@ def _extract_entities(question: str) -> dict[str, Any]:
     # `<PREFIX>_WC<digits>_<digits>` form is used — bare N/P codes are part of fault
     # descriptions for some datasets and would mis-filter.
     if "故障代码" not in entities:
-        fault_code = _first_match([r"([A-Z]{2,3}_WC\d+_\d+)"], q)
+        fault_code = _first_match([_FAULT_CODE_WC_PATTERN], q)
         if fault_code:
             entities["故障代码"] = fault_code
 
@@ -236,11 +244,11 @@ def _extract_entities(question: str) -> dict[str, Any]:
 def _weak_extract(question: str) -> dict[str, Any]:
     entities: dict[str, Any] = {}
 
-    # Fault code patterns: NQ_WC120_039, BD_WC200_044, N709, P705, etc.
+    # Fault code patterns: NQ_WC120_039, BD_WC200_044, BD_WC73OP27_8809, N709, P705, etc.
     fc = _first_match(
         [
-            r"([A-Z]{2,3}_WC\d+_\d+)",
-            r"([NBP]\d{3,4}[A-Z&.]?\S*)",
+            _FAULT_CODE_WC_PATTERN,
+            _FAULT_CODE_BARE_PATTERN,
         ],
         question,
     )
