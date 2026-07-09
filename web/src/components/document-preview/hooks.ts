@@ -3,10 +3,9 @@ import { useGetKnowledgeSearchParams } from '@/hooks/route-hook';
 import { useGetPipelineResultSearchParams } from '@/pages/dataflow-result/hooks';
 import api, { restAPIv1 } from '@/utils/api';
 import { getAuthorization } from '@/utils/authorization-util';
-import jsPreviewExcel from '@js-preview/excel';
 import { useSize } from 'ahooks';
 import axios from 'axios';
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useState } from 'react';
 
 export const useDocumentResizeObserver = () => {
   const [containerWidth, setContainerWidth] = useState<number>();
@@ -62,24 +61,6 @@ export const useGetDocumentUrl = (isAgent: boolean) => {
   return url;
 };
 
-export const useCatchError = (api: string) => {
-  const [error, setError] = useState('');
-  const fetchDocument = useCallback(async () => {
-    const ret = await axios.get(api);
-    const { data } = ret;
-    if (!(data instanceof ArrayBuffer) && data.code !== 0) {
-      setError(data.message);
-    }
-    return ret;
-  }, [api]);
-
-  useEffect(() => {
-    fetchDocument();
-  }, [fetchDocument]);
-
-  return { fetchDocument, error };
-};
-
 export const useFetchDocument = () => {
   const fetchDocument = useCallback(async (api: string) => {
     const ret = await axios.get(api, {
@@ -92,38 +73,6 @@ export const useFetchDocument = () => {
   }, []);
 
   return { fetchDocument };
-};
-
-export const useFetchExcel = (filePath: string) => {
-  const [status, setStatus] = useState(true);
-  const { fetchDocument } = useFetchDocument();
-  const containerRef = useRef<HTMLDivElement>(null);
-  const { error } = useCatchError(filePath);
-
-  const fetchDocumentAsync = useCallback(async () => {
-    let myExcelPreviewer;
-    if (containerRef.current) {
-      myExcelPreviewer = jsPreviewExcel.init(containerRef.current);
-    }
-    const jsonFile = await fetchDocument(filePath);
-    myExcelPreviewer
-      ?.preview(jsonFile.data)
-      .then(() => {
-        console.log('succeed');
-        setStatus(true);
-      })
-      .catch((e) => {
-        console.warn('failed', e);
-        myExcelPreviewer.destroy();
-        setStatus(false);
-      });
-  }, [filePath, fetchDocument]);
-
-  useEffect(() => {
-    fetchDocumentAsync();
-  }, [fetchDocumentAsync]);
-
-  return { status, containerRef, error };
 };
 
 export const useCatchDocumentError = (url: string) => {
